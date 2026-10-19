@@ -125,6 +125,7 @@ admin/                手机端发布 App（可选，见 admin/README.md）
   build-apk.sh             零 Gradle 构建（aapt2 + javac + d8 + apksigner）
   run-tests.sh             用两端真实源码做的协议回归测试
 
+docs/reverse/               母 APK 顶栏 / 服务器切换 / 排序逻辑的反编译归档
 dist/config.enc.json         发布产物（入库）
 dist/config.enc.example.json 示例产物（假账号，用来验证本地链路是否通）
 config/config.json           明文配置（不入库）
