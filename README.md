@@ -106,6 +106,7 @@ powershell -ExecutionPolicy Bypass -File .\build\build.ps1 `
 ```
 app/src/com/dh/myembyapp/sync/
   SyncProvider.java   入口。ContentProvider.onCreate 早于 Application/Activity，这是"同一次启动生效"的前提
+  HomeBar.java        首页顶栏的服务器圆点（挂 decorView，不申请悬浮窗权限）
   Envelope.java       验签 + 解密 + 防回滚。唯一承载安全的部分
   Fetcher.java        单 URL 抓取（线程 + join 硬超时），镜像地址拼装
   Probe.java          探测当前服务器是否还活着 + sync_status.txt 落盘
@@ -148,7 +149,7 @@ node tools/publish.mjs verify --in dist/config.enc.example.json \
 | 场景 | 电脑（本目录） | 手机（`admin/`） |
 |---|---|---|
 | 改账号 | 编辑 `config.json` → `publish` → push | App 里改 → 点「发布」 |
-| 刷令牌 | `node tools/publish.mjs refresh` | 点「刷新全部令牌」 |
+| 刷令牌 | `node tools/publish.mjs refresh` | 勾选后点「刷新选中」 |
 | 首次配置 | `genkey` + 写 config | 粘贴一次 bootstrap JSON |
 
 关键区别只有一条：**发布私钥不在 APK 里**。母 APK 放 `master` 是安全的（只能解、不能伪造），
@@ -156,7 +157,7 @@ node tools/publish.mjs verify --in dist/config.enc.example.json \
 所以它走"首次导入 + AndroidKeyStore 加密存盘"，代价是换手机不能靠备份迁移。
 
 ```bash
-bash admin/build-apk.sh     # → admin/dist/ChaiSync-admin-1.0.5.apk（46 KiB，零 Gradle）
+bash admin/build-apk.sh     # → admin/dist/ChaiSync-admin-1.0.6.apk（52 KiB，零 Gradle）
 bash admin/run-tests.sh     # 协议回归测试，不需要设备
 ```
 
@@ -179,6 +180,24 @@ bash admin/run-tests.sh     # 协议回归测试，不需要设备
 
 拉取时按 `mirrors` 顺序逐个试，每个响应都过一遍 `Envelope.open()`：
 验签失败或被判 rollback 就换下一个源，全挂才保留本地。
+
+---
+
+## 电视端：顶栏服务器圆点
+
+母 APK 的 `MainActivity` 顶部会叠加一排圆点，**推送过几台就显示几个**（读 `sync_settings.managed_ids`）：
+
+- 当前 `last_used_server` 对应的圆点是绿色，其余是半透明白。
+- 按遥控器左右键在圆点间移动，按 OK 切换；切换会写 `server_configs.last_used_server` 并 `recreate()` 当前 Activity。
+- 切换只影响电视本地，不回写 GitHub；下次同步也不会被云端 `lastUsedServerId` 顶回去。
+- 圆点挂在 `decorView` 上，不申请悬浮窗权限，也不改原 APK 的 Compose 代码。
+
+**启动故障转移**：`SyncProvider` 探测当前服务器失败（TCP 不通 / token 无效）时，
+会按 `server_order` 顺序尝试后面的服务器，最多 3.5 秒；第一台能用就写 `last_used_server`，
+首屏直接用它。拉取新配置失败、只能留本地时也会走这一步。健康启动不会触发，也不会多花时间。
+
+> **兼容性**：子 APK 1.0.6 的「部分推送」依赖母 APK 1.1 的 `partial` 语义。
+> 旧母 APK 会把未勾选的服务器当成“已删除”。**先升级电视端，再用子 APK 做部分推送。**
 
 ---
 
@@ -251,6 +270,11 @@ adb shell cat /sdcard/Android/data/com.dh.myembyapp/files/sync_status.txt
    缓解办法：多放几个；或者让信封正文里也带一份 `mirrors`，客户端每次成功拉取后自我更新。
 5. **打包链路未在本机端到端跑过**。`apktool / d8 / zipalign / apksigner` 沿用旧项目已验证的流程，
    但这一版没有实机验证；第一次跑请留意 `[4/7] javac` 与 `[5/7] splice` 两处的输出。
+6. **顶栏圆点是覆盖层**，不修改原 App 布局。它固定在右上角；如果原 App 那里正好有按钮，
+   视觉上会重叠，但不影响原按钮的触摸区域（圆点只占自己的 27dp）。
+7. **切换服务器会 `recreate()` 当前 Activity**。在首页切换无感；如果在播放页切换，播放会中断重建。
+   建议只在首页顶栏操作。
+8. **故障转移只在启动时做一次**。运行中服务器掉线不会自动切；下次冷启动才会。
 
 ---
 

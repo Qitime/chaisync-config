@@ -22,6 +22,8 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.widget.CheckBox;
+import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -70,6 +72,8 @@ public final class MainActivity extends Activity {
     private TextView logView;
     private ScrollView logScroll;
     private View publishBtn;
+    private View refreshBtn;
+    private TextView selectInfo;
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     @Override
@@ -143,6 +147,35 @@ public final class MainActivity extends Activity {
         listBox = new LinearLayout(this);
         listBox.setOrientation(LinearLayout.VERTICAL);
         root.addView(listBox, new ViewGroup.LayoutParams(MP, WC));
+
+        LinearLayout selRow = new LinearLayout(this);
+        selRow.setOrientation(LinearLayout.HORIZONTAL);
+        selRow.setGravity(Gravity.CENTER_VERTICAL);
+        selRow.setPadding(0, 0, 0, dp(8));
+
+        selectInfo = tv("已选 0 / 0", 11.5f, C_DIM, false);
+        selRow.addView(selectInfo, new LinearLayout.LayoutParams(0, WC, 1f));
+
+        TextView allBtn = chip("全选", C_CHIP, C_DIM, 11, dp(6), dp(10));
+        allBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                selectAll(true);
+            }
+        });
+        selRow.addView(allBtn, new ViewGroup.LayoutParams(WC, WC));
+
+        TextView noneBtn = chip("全不选", C_CHIP, C_DIM, 11, dp(6), dp(10));
+        noneBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                selectAll(false);
+            }
+        });
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(WC, WC);
+        nlp.leftMargin = dp(8);
+        selRow.addView(noneBtn, nlp);
+        root.addView(selRow);
 
         TextView addBtn = chip("+ 新增服务器", C_CHIP, C_TEXT, 13, dp(10), dp(14));
         addBtn.setOnClickListener(new View.OnClickListener() {
@@ -224,19 +257,20 @@ public final class MainActivity extends Activity {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setPadding(0, 0, 0, dp(22));
 
-        TextView refresh = chip("刷新全部令牌", C_CHIP, C_TEXT, 13, dp(12), dp(14));
+        TextView refresh = chip("刷新选中", C_CHIP, C_TEXT, 13, dp(12), dp(14));
         refresh.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 refreshAll();
             }
         });
+        refreshBtn = refresh;
         LinearLayout.LayoutParams lp1 =
                 new LinearLayout.LayoutParams(0, WC, 1f);
         lp1.rightMargin = dp(10);
         row.addView(refresh, lp1);
 
-        TextView pub = chip("发布到 GitHub", C_ACCENT, 0xFFFFFFFF, 13, dp(12), dp(14));
+        TextView pub = chip("发布选中", C_ACCENT, 0xFFFFFFFF, 13, dp(12), dp(14));
         pub.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -302,6 +336,7 @@ public final class MainActivity extends Activity {
             TextView empty = tv("还没有服务器。点下面「+ 新增服务器」。", 12.5f, C_FAINT, false);
             empty.setPadding(dp(4), dp(2), 0, dp(10));
             listBox.addView(empty);
+            updateSelectionUi();
             return;
         }
 
@@ -311,6 +346,73 @@ public final class MainActivity extends Activity {
                 continue;
             }
             listBox.addView(serverCard(s, i));
+        }
+        updateSelectionUi();
+    }
+
+    /** 旧状态没有 selected 字段时按选中处理。 */
+    private boolean isSelected(JSONObject s) {
+        return s != null && s.optBoolean("selected", true);
+    }
+
+    private void selectedCounts(int[] out) {
+        int total = 0;
+        int sel = 0;
+        JSONArray arr = state.optJSONArray("servers");
+        if (arr != null) {
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject s = arr.optJSONObject(i);
+                if (s == null || s.optString("id", "").isEmpty()) {
+                    continue;
+                }
+                total++;
+                if (isSelected(s)) {
+                    sel++;
+                }
+            }
+        }
+        out[0] = sel;
+        out[1] = total;
+    }
+
+    private void updateSelectionUi() {
+        int[] c = new int[2];
+        selectedCounts(c);
+        int sel = c[0];
+        int total = c[1];
+        if (selectInfo != null) {
+            selectInfo.setText("已选 " + sel + " / " + total);
+            selectInfo.setTextColor(sel == 0 ? C_WARN : C_DIM);
+        }
+        if (refreshBtn != null) {
+            ((TextView) refreshBtn).setText("刷新选中 (" + sel + ")");
+            refreshBtn.setEnabled(sel > 0);
+            refreshBtn.setAlpha(sel > 0 ? 1f : 0.45f);
+        }
+        if (publishBtn != null) {
+            boolean ready = Vault.isReady(state);
+            ((TextView) publishBtn).setText("发布选中 (" + sel + ")");
+            publishBtn.setEnabled(ready && sel > 0);
+            publishBtn.setAlpha(ready && sel > 0 ? 1f : 0.45f);
+        }
+    }
+
+    private void selectAll(boolean on) {
+        JSONArray arr = state.optJSONArray("servers");
+        if (arr == null) {
+            return;
+        }
+        try {
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject s = arr.optJSONObject(i);
+                if (s != null) {
+                    s.put("selected", on);
+                }
+            }
+            persist();
+            render();
+        } catch (Throwable t) {
+            toast("保存勾选状态失败：" + t.getMessage());
         }
     }
 
@@ -326,6 +428,26 @@ public final class MainActivity extends Activity {
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
+
+        final CheckBox cb = new CheckBox(this);
+        cb.setChecked(isSelected(s));
+        cb.setButtonTintList(ColorStateList.valueOf(C_ACCENT));
+        cb.setPadding(0, 0, dp(7), 0);
+        cb.setMinWidth(0);
+        cb.setMinimumWidth(0);
+        cb.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                try {
+                    s.put("selected", isChecked);
+                    persist();
+                    updateSelectionUi();
+                } catch (Throwable t) {
+                    toast("保存勾选状态失败：" + t.getMessage());
+                }
+            }
+        });
+        top.addView(cb, new ViewGroup.LayoutParams(WC, WC));
 
         String alias = s.optString("alias", "");
         if (alias.isEmpty()) {
@@ -755,6 +877,7 @@ public final class MainActivity extends Activity {
                         o.put("useEmbyPrefix", false);
                         o.put("trustAllCerts", false);
                         o.put("backupRoutes", new JSONArray());
+                        o.put("selected", true);
                     } else {
                         copyIfPresent(s, o, "userId");
                         copyIfPresent(s, o, "accessToken");
@@ -766,6 +889,7 @@ public final class MainActivity extends Activity {
                         copyIfPresent(s, o, "trustAllCerts");
                         copyIfPresent(s, o, "backupRoutes");
                         copyIfPresent(s, o, "deviceId");
+                        copyIfPresent(s, o, "selected");
                     }
 
                     JSONArray servers = state.optJSONArray("servers");
@@ -796,7 +920,7 @@ public final class MainActivity extends Activity {
         new AlertDialog.Builder(this)
                 .setTitle("删除「" + fallback(s.optString("alias"), s.optString("host")) + "」")
                 .setMessage("下一次发布会把这条从电视上移除，同时删掉电视上的这个服务器配置。\n\n"
-                        + "（母 APK 的 Store 会按 managed_ids 做差集删除，这是它的既定行为。）")
+                        + "删除会在下次发布时随信封的 removedIds 一起下发，即使这次只勾选了别的服务器也会生效。")
                 .setPositiveButton("删除", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface d, int w) {
@@ -812,6 +936,15 @@ public final class MainActivity extends Activity {
                         }
                         try {
                             state.put("servers", next);
+                            JSONArray pending = state.optJSONArray("pendingRemoved");
+                            if (pending == null) {
+                                pending = new JSONArray();
+                                state.put("pendingRemoved", pending);
+                            }
+                            String removedId = s.optString("id", "");
+                            if (!removedId.isEmpty()) {
+                                pending.put(removedId);
+                            }
                             if (next.length() > 0
                                     && s.optString("id").equals(state.optString("lastUsedServerId"))) {
                                 state.put("lastUsedServerId",
@@ -819,7 +952,8 @@ public final class MainActivity extends Activity {
                             }
                             persist();
                             render();
-                            log("已删除 " + fallback(s.optString("alias"), s.optString("host")));
+                            log("已删除 " + fallback(s.optString("alias"), s.optString("host"))
+                                    + "（待下次发布移除）");
                         } catch (Throwable t) {
                             toast("删除失败：" + t.getMessage());
                         }
@@ -868,21 +1002,29 @@ public final class MainActivity extends Activity {
             toast("还没有服务器");
             return;
         }
-        final ProgressDialog pd = busy("正在刷新令牌…");
+        int[] c = new int[2];
+        selectedCounts(c);
+        if (c[0] == 0) {
+            toast("先勾选要刷新的服务器");
+            return;
+        }
+        final ProgressDialog pd = busy("正在刷新选中的 " + c[0] + " 台…");
         new Thread(new Runnable() {
             @Override
             public void run() {
                 JSONArray arr = state.optJSONArray("servers");
                 int ok = 0;
                 int fail = 0;
+                int skipped = 0;
                 final StringBuilder detail = new StringBuilder();
                 for (int i = 0; i < arr.length(); i++) {
                     JSONObject s = arr.optJSONObject(i);
-                    if (s == null) {
+                    if (s == null || !isSelected(s)) {
                         continue;
                     }
                     String label = fallback(s.optString("alias"), s.optString("host"));
                     if (s.optString("username", "").isEmpty() || s.optString("password", "").isEmpty()) {
+                        skipped++;
                         detail.append("· ").append(label).append("：没填账号密码，跳过\n");
                         continue;
                     }
@@ -906,19 +1048,21 @@ public final class MainActivity extends Activity {
                 }
                 final int fok = ok;
                 final int ffail = fail;
+                final int fskip = skipped;
                 ui.post(new Runnable() {
                     @Override
                     public void run() {
                         dismiss(pd);
                         render();
-                        log("刷新完成：" + fok + " 成功 / " + ffail + " 失败");
+                        log("刷新完成：" + fok + " 成功 / " + ffail + " 失败"
+                                + (fskip > 0 ? " / " + fskip + " 跳过" : ""));
                         for (String line : detail.toString().split("\n")) {
                             if (!line.trim().isEmpty()) {
                                 log("  " + line);
                             }
                         }
                         if (fok == 0) {
-                            toast("一台都没成功，先检查账号密码与连通性");
+                            toast("选中的一台都没成功，先检查账号密码与连通性");
                         }
                     }
                 });
@@ -932,18 +1076,30 @@ public final class MainActivity extends Activity {
             showBootstrapDialog();
             return;
         }
-        JSONArray servers = state.optJSONArray("servers");
-        int n = servers == null ? 0 : servers.length();
+        int[] c = new int[2];
+        selectedCounts(c);
+        int n = c[1];
+        int sel = c[0];
         if (n == 0) {
             toast("至少要有一台服务器");
             return;
         }
+        if (sel == 0) {
+            toast("先勾选要推送的服务器");
+            return;
+        }
         final long seq = state.optLong("localSeq", 0) + 1;
+        boolean partial = sel < n;
+        int removed = state.optJSONArray("pendingRemoved") == null
+                ? 0 : state.optJSONArray("pendingRemoved").length();
 
         String msg = "seq  " + state.optLong("localSeq", 0) + "  →  " + seq + "\n"
-                + "服务器  " + n + " 台\n"
+                + "本次推送  " + sel + " 台" + (partial ? "（共 " + n + " 台，部分推送）" : "") + "\n"
+                + (removed > 0 ? "同时删除  " + removed + " 台\n" : "")
                 + "目标  " + boot.optString("repo") + "  @" + boot.optString("branch", "main") + "\n"
                 + "路径  " + boot.optString("path", "dist/config.enc.json") + "\n\n"
+                + (partial ? "未勾选的服务器不会被改动，也不会被电视删除。\n\n" : "")
+                + (partial ? "⚠ 需要电视端 ChaiSync-tv 1.1+；旧母 APK 不认识 partial，会把未勾选项删掉。\n\n" : "")
                 + "发布后 raw 有 5 分钟缓存，电视最迟 5 分钟后看到；\n"
                 + "客户端检测到 seq 不前进会自动换缓存键重问一次。";
 
@@ -985,6 +1141,7 @@ public final class MainActivity extends Activity {
                             dismiss(pd);
                             render();
                             log("发布成功 seq=" + o.seq + "  servers=" + o.servers
+                                    + (o.partial ? "/" + o.total + " (部分)" : "")
                                     + "  明文 " + o.plainBytes + "B → 信封 "
                                     + (o.envelopeBytes / 1024f) + "KiB"
                                     + (o.firstPublish ? "  (首次)" : ""));

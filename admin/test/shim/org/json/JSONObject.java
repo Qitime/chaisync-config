@@ -81,6 +81,10 @@ public class JSONObject {
         return ((Number) get(k)).longValue();
     }
 
+    public String optString(String k) {
+        return optString(k, "");
+    }
+
     public String optString(String k, String dflt) {
         Object v = m.get(k);
         return v == null || v == NULL ? dflt : String.valueOf(v);
