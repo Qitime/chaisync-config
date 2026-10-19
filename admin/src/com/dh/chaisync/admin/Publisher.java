@@ -32,9 +32,7 @@ public final class Publisher {
 
     public static final class Outcome {
         public long seq;
-        public int servers;      // 本次实际推送的台数
-        public int total;        // 本地服务器总数
-        public boolean partial;  // true = 只推送了勾选的一部分
+        public int servers;
         public int plainBytes;
         public int envelopeBytes;
         public String commit = "";
@@ -86,24 +84,6 @@ public final class Publisher {
             throw new IllegalStateException("至少要有一台服务器才能发布（母 APK 收到空列表会跳过）");
         }
 
-        // 勾选语义：只推送选中的条目。未勾选的服务器不会被写进信封，
-        // 母 APK 收到 partial=true 时也不会按 managed_ids 做差集删除。
-        boolean partial = false;
-        int total = 0;
-        for (int i = 0; i < servers.length(); i++) {
-            JSONObject s = servers.optJSONObject(i);
-            if (s == null || s.optString("id", "").isEmpty()) {
-                continue;
-            }
-            total++;
-            if (!isSelected(s)) {
-                partial = true;
-            }
-        }
-        if (total == 0) {
-            throw new IllegalStateException("没有有效服务器条目（id 不能为空）");
-        }
-
         // ① 读远端，拿 sha 与已有 seq
         cb.step("读取远端信封…");
         GitHubClient.Remote remote = GitHubClient.getRemote(apiBase, repo, path, branch, token, 15000);
@@ -124,7 +104,7 @@ public final class Publisher {
             cb.step("远端 seq=" + remoteSeq + " 比本地大，按远端对齐");
         }
 
-        // ② 组装正文（只放勾选项）
+        // ② 组装正文
         JSONArray clean = new JSONArray();
         int missingToken = 0;
         for (int i = 0; i < servers.length(); i++) {
@@ -133,7 +113,7 @@ public final class Publisher {
                 continue;
             }
             String id = s.optString("id", "");
-            if (id.isEmpty() || !isSelected(s)) {
+            if (id.isEmpty()) {
                 continue;
             }
             clean.put(normalize(s));
@@ -142,57 +122,33 @@ public final class Publisher {
             }
         }
         if (clean.length() == 0) {
-            throw new IllegalStateException("一台服务器都没勾选，先勾选要推送的服务器");
+            throw new IllegalStateException("没有有效服务器条目（id 不能为空）");
         }
         if (missingToken > 0) {
-            final String w = missingToken + " 台已勾选服务器还没有 accessToken，"
-                    + "电视会写入但登录失败，建议先点「刷新选中」";
+            final String w = missingToken + " 台服务器还没有 accessToken，"
+                    + "电视会写入但登录失败，建议先点「刷新令牌」";
             cb.step(w);
         }
 
-        // 当前使用中的服务器：部分推送时如果它没被勾选，也不要强行改成第一台，
-        // 否则电视会因为你这次只推了别的服务器而被动换服。
         String last = state.optString("lastUsedServerId", "");
-        boolean lastInAll = false;
-        for (int i = 0; i < servers.length(); i++) {
-            JSONObject s = servers.optJSONObject(i);
-            if (s != null && last.equals(s.optString("id", ""))) {
-                lastInAll = true;
+        boolean lastValid = false;
+        for (int i = 0; i < clean.length(); i++) {
+            if (last.equals(clean.optJSONObject(i).optString("id", ""))) {
+                lastValid = true;
                 break;
             }
         }
-        if (!partial || !lastInAll) {
-            boolean lastValid = false;
-            for (int i = 0; i < clean.length(); i++) {
-                if (last.equals(clean.optJSONObject(i).optString("id", ""))) {
-                    lastValid = true;
-                    break;
-                }
-            }
-            if (!lastValid) {
-                last = clean.optJSONObject(0).optString("id", "");
-            }
-        }
-
-        JSONArray removed = new JSONArray();
-        JSONArray pendingRemoved = state.optJSONArray("pendingRemoved");
-        if (pendingRemoved != null) {
-            for (int i = 0; i < pendingRemoved.length(); i++) {
-                String id = pendingRemoved.optString(i, "");
-                if (!id.isEmpty()) {
-                    removed.put(id);
-                }
-            }
+        if (!lastValid) {
+            last = clean.optJSONObject(0).optString("id", "");
         }
 
         JSONObject payload = new JSONObject();
         payload.put("kind", "accounts");
         payload.put("mode", "sync");
         payload.put("seq", seq);
-        payload.put("partial", partial);
         payload.put("lastUsedServerId", last);
         payload.put("servers", clean);
-        payload.put("removedIds", removed);
+        payload.put("removedIds", new JSONArray());
 
         byte[] plain = payload.toString().getBytes("UTF-8");
 
@@ -214,8 +170,7 @@ public final class Publisher {
         // ⑤ 推送
         cb.step("推送到 GitHub…");
         JSONObject body = new JSONObject();
-        body.put("message", "chaisync: publish seq=" + seq + " (" + clean.length()
-                + (partial ? "/" + total : "") + " servers" + (partial ? ", partial" : "") + ")");
+        body.put("message", "chaisync: publish seq=" + seq + " (" + clean.length() + " servers)");
         body.put("content", android.util.Base64.encodeToString(
                 env.toString().getBytes("UTF-8"), android.util.Base64.NO_WRAP));
         body.put("branch", branch);
@@ -232,8 +187,6 @@ public final class Publisher {
         Outcome o = new Outcome();
         o.seq = seq;
         o.servers = clean.length();
-        o.total = total;
-        o.partial = partial;
         o.plainBytes = plain.length;
         o.envelopeBytes = env.toString().getBytes("UTF-8").length;
         o.firstPublish = remote == null;
@@ -251,8 +204,6 @@ public final class Publisher {
         }
 
         state.put("localSeq", seq);
-        // 删除动作已经随本次信封下发，清掉待删列表；失败时保留，下次重试
-        state.put("pendingRemoved", new JSONArray());
         JSONObject lastPub = new JSONObject();
         lastPub.put("seq", seq);
         lastPub.put("at", System.currentTimeMillis());
@@ -261,11 +212,6 @@ public final class Publisher {
         state.put("lastPublish", lastPub);
 
         return o;
-    }
-
-    /** 旧状态里没有 selected 字段，一律按“选中”处理，避免升级后默认全不选。 */
-    private static boolean isSelected(JSONObject s) {
-        return s == null || s.optBoolean("selected", true);
     }
 
     /**

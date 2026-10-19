@@ -32,7 +32,7 @@
 
 ```bash
 bash build-apk.sh
-# → dist/ChaiSync-admin-1.0.6.apk  （约 52 KiB）
+# → dist/ChaiSync-admin-1.0.1.apk  （约 45 KiB）
 ```
 
 不依赖 Gradle、不联网、不下载任何东西，只用 build-tools 自带的 `aapt2 / javac / d8 / zipalign / apksigner`。所以整个 App 是 framework API + 代码构建界面，没有 AndroidX。
@@ -66,7 +66,7 @@ node tools/make-bootstrap-page.mjs      # 生成 dist/bootstrap.html
 **③ 日常三步**
 
 ```
-勾选服务器  →  刷新选中  →  发布选中
++ 新增服务器  →  刷新全部令牌  →  发布到 GitHub
 ```
 
 这三步都在主界面，但碰的是**两套完全不同的配置**，别混：
@@ -75,16 +75,6 @@ node tools/make-bootstrap-page.mjs      # 生成 dist/bootstrap.html
 |---|---|---|
 | 顶部状态卡（点一下 / 长按） | GitHub：`owner/repo`、`branch`、`path`、PAT、发布私钥、镜像 | **一次**，粘贴 bootstrap JSON |
 | 「+ 新增服务器」 | Emby：协议、host、port、账号、密码、别名 | 每台服务器一次 |
-| 服务器卡片左侧复选框 | 本次要刷新/推送哪些服务器 | 每次操作前 |
-
-勾选是**部分推送**：只把选中的服务器写进信封，母 APK 收到 `partial=true` 后
-只更新这些条目，不会把未勾选的服务器从电视上删掉。
-
-- 「全选 / 全不选」在列表上方，旁边显示「已选 N / M」。
-- 删除服务器仍然会随下次发布下发 `removedIds`，即使这次只勾选了别的服务器也会删掉它。
-- 未勾选的服务器 token 不会被刷新；要更新它们就勾上再点「刷新选中」。
-- 只推送一部分时，`lastUsedServerId` 不会强行改成第一台；电视本地当前使用的那台保持不变。
-- **部分推送要求电视端 `ChaiSync-tv 1.1+`。** 旧母 APK 不认识 `partial`，会把未勾选的服务器当成“已从清单里删除”，从电视上删掉。升级顺序：先装新电视端，再用 1.0.6 子 APK 做部分推送。
 
 「服务器」指的是 Emby 媒体服务器，**不是 GitHub 仓库**。App 不登录 GitHub、不自动发现仓库，也不读你电脑上的 git 配置——推到哪里完全由状态卡里那份 bootstrap 决定（`repo` / `branch` / `path` 三个字段）。
 
@@ -97,7 +87,7 @@ node tools/make-bootstrap-page.mjs      # 生成 dist/bootstrap.html
 | Worker 的职责 | 子 APK 里对应什么 | 是否等价 |
 |---|---|---|
 | 存账号、下发 `/api/config` | 本地编辑 + 封装成信封推到 GitHub | ✅ |
-| 刷新 Emby 令牌 | 「刷新选中」按钮，调 `AuthenticateByName` | ✅ 更安全：Emby 密码不再存在服务端数据库里 |
+| 刷新 Emby 令牌 | 「刷新全部令牌」按钮，调 `AuthenticateByName` | ✅ 更安全：Emby 密码不再存在服务端数据库里 |
 | 管理页增删改查 | 就是 App 界面本身 | ✅ |
 | 设备白名单 / `HMAC(APP_SECRET, device_id)` | **没有** | ❌ 见下 |
 | 定时刷新（Cron） | 没有；改成手动按 | ⚠️ 降级 |
@@ -161,6 +151,5 @@ bash run-tests.sh
 
 | 版本 | 变更 |
 |---|---|
-| **1.0.6** | 服务器卡片增加勾选；刷新/发布只处理选中项；信封带 `partial=true`，母 APK 不再把未勾选服务器删掉；删除走 `removedIds` 显式下发。 |
 | **1.0.1** | 修 `caller-provided iv not permitted`。AndroidKeyStore 生成的 AES 密钥默认 `setRandomizedEncryptionRequired(true)`，此时 `Cipher.init(ENCRYPT_MODE, key, GCMParameterSpec)` 会抛 `InvalidKeyException` —— IV 必须由 Keystore 生成。`Vault.save` 改为两参数 `init` + `getIV()`。副标题现在显示版本号，方便确认装的是哪一版。 |
 | 1.0 | 首个版本。**导入 bootstrap 必然失败**，别用。 |
