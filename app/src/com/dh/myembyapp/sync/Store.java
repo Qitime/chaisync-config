@@ -165,6 +165,10 @@ public final class Store {
             byId.put(id, target);
         }
 
+        // partial：发布端只勾选了一部分服务器。此时绝不能按 managed_ids 做差集删除，
+        // 否则"这次只推 A"会顺手把电视上的 B、C 删掉。
+        boolean partial = payload.optBoolean("partial", false);
+
         Set<String> remove = new HashSet<String>();
         JSONArray removedIds = payload.optJSONArray("removedIds");
         if (removedIds != null) {
@@ -178,42 +182,107 @@ public final class Store {
         } catch (Throwable t) {
             managed = new JSONArray();
         }
-        for (int i = 0; i < managed.length(); i++) {
-            String id = managed.optString(i, "");
-            if (!id.isEmpty() && !desiredSet.contains(id)) {
-                remove.add(id);
+        if (!partial) {
+            for (int i = 0; i < managed.length(); i++) {
+                String id = managed.optString(i, "");
+                if (!id.isEmpty() && !desiredSet.contains(id)) {
+                    remove.add(id);
+                }
             }
         }
 
         JSONArray result = new JSONArray();
-        for (Map.Entry<String, JSONObject> e : byId.entrySet()) {
-            if (desiredSet.contains(e.getKey()) || remove.contains(e.getKey())) {
-                continue;
-            }
-            result.put(e.getValue());
-        }
-        for (String id : desired) {
-            result.put(byId.get(id));
-        }
-
         JSONArray order = new JSONArray();
-        for (String id : desired) {
-            order.put(id);
-        }
-        for (int i = 0; i < result.length(); i++) {
-            JSONObject o = result.optJSONObject(i);
-            if (o == null) {
-                continue;
+        if (partial) {
+            // 保持电视上已有顺序，只把本次条目原地更新；新条目追加到末尾。
+            // byId 的迭代顺序天然就是"原有条目在前、新条目在后"。
+            for (Map.Entry<String, JSONObject> e : byId.entrySet()) {
+                if (remove.contains(e.getKey())) {
+                    continue;
+                }
+                result.put(e.getValue());
+                order.put(e.getKey());
             }
-            String id = o.optString("id", "");
-            if (!desiredSet.contains(id)) {
+        } else {
+            for (Map.Entry<String, JSONObject> e : byId.entrySet()) {
+                if (desiredSet.contains(e.getKey()) || remove.contains(e.getKey())) {
+                    continue;
+                }
+                result.put(e.getValue());
+            }
+            for (String id : desired) {
+                result.put(byId.get(id));
+            }
+            for (String id : desired) {
                 order.put(id);
             }
+            for (int i = 0; i < result.length(); i++) {
+                JSONObject o = result.optJSONObject(i);
+                if (o == null) {
+                    continue;
+                }
+                String id = o.optString("id", "");
+                if (!desiredSet.contains(id)) {
+                    order.put(id);
+                }
+            }
         }
 
+        // 发布端显式排序：orderIds 包含子 APK 里的完整顺序（含本次未勾选的服务器）。
+        // 只要它存在，就以它为准重写 server_order——否则部分推送只能保留电视旧顺序，
+        // 用户在子 APK 里点“上移/下移”就白点了。
+        JSONArray requestedOrder = payload.optJSONArray("orderIds");
+        if (requestedOrder != null && requestedOrder.length() > 0) {
+            JSONArray reordered = new JSONArray();
+            Set<String> used = new HashSet<String>();
+            for (int i = 0; i < requestedOrder.length(); i++) {
+                String id = requestedOrder.optString(i, "");
+                if (!id.isEmpty() && !used.contains(id) && containsId(result, id)) {
+                    reordered.put(id);
+                    used.add(id);
+                }
+            }
+            for (int i = 0; i < result.length(); i++) {
+                JSONObject o = result.optJSONObject(i);
+                if (o == null) {
+                    continue;
+                }
+                String id = o.optString("id", "");
+                if (!id.isEmpty() && !used.contains(id)) {
+                    reordered.put(id);
+                    used.add(id);
+                }
+            }
+            order = reordered;
+        }
+
+        // 本地切换优先：用户在电视顶栏点过哪台，就保持哪台。
+        // 云端下发的 lastUsedServerId 只在本地没有有效选择时生效，
+        // 否则每次后台同步都会把用户手动切的服务器顶回去。
+        String existingLast = sp.getString("last_used_server", "");
+        boolean existingValid = containsId(result, existingLast);
         String last = payload.optString("lastUsedServerId", "");
-        if (last.isEmpty() || !desiredSet.contains(last)) {
-            last = desired.get(0);
+        if (existingValid) {
+            last = existingLast;
+        } else if (!containsId(result, last)) {
+            last = result.length() > 0
+                    ? result.optJSONObject(0).optString("id", "") : "";
+        }
+
+        // managed_ids：partial 取并集，full 取本次列表（full 才允许差集删除）
+        List<String> managedNext = new ArrayList<String>();
+        if (partial) {
+            for (int i = 0; i < managed.length(); i++) {
+                String id = managed.optString(i, "");
+                if (!id.isEmpty() && !remove.contains(id) && !managedNext.contains(id)) {
+                    managedNext.add(id);
+                }
+            }
+        }
+        for (String id : desired) {
+            if (!managedNext.contains(id)) {
+                managedNext.add(id);
+            }
         }
 
         boolean ok = sp.edit()
@@ -223,13 +292,27 @@ public final class Store {
                 .commit();
 
         sync.edit()
-                .putString("managed_ids", new JSONArray(desired).toString())
+                .putString("managed_ids", new JSONArray(managedNext).toString())
                 .putLong("applied_seq", seq)
                 .commit();
 
         Probe.journal(ctx, "applied seq=" + seq + " servers=" + result.length()
+                + (partial ? " partial=" + desired.size() : "")
                 + " default=" + last + " committed=" + ok);
         return true;
+    }
+
+    private static boolean containsId(JSONArray arr, String id) {
+        if (id == null || id.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject o = arr.optJSONObject(i);
+            if (o != null && id.equals(o.optString("id", ""))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void merge(JSONObject target, JSONObject source) {

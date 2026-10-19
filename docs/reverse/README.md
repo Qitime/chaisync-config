@@ -3,8 +3,8 @@
 归档目的：把母 APK 顶栏、服务器切换、服务器排序相关的反编译结果留在仓库里，
 以后改注入代码时不用每次重新拆包。
 
-> **当前仓库状态**：代码已回退到 1.0 基线（commit `4ae1648`）。
-> 本目录只保留分析，不包含之前实验性的顶栏圆点、部分推送、启动故障转移等改动。
+> **当前仓库状态**：子 APK 1.0.7 + 母 APK 1.2。
+> 保留勾选/部分推送、`orderIds` 排序、启动故障转移；**不再包含顶栏圆点**。
 
 - 源 APK：`C:\Users\qiqi\Downloads\ChaiChaiEmbyTV-0.3.1-alpha3-arm64-v8a.apk`
 - 反编译对象：`build/decoded/classes4.dex`（UI / 业务逻辑主要在 classes4）
@@ -142,39 +142,39 @@ return plus(ordered, sortDescByLastLoginTime(remaining));
 - `buildStoredOrderWithAllServerIds`：保留 order 中仍存在的 id，其余 id 按传入的
   `allServerIds`（`servers` 数组）顺序追加。
 
-### 3.3 子 APK 推送能不能控制排序（1.0 基线）
+### 3.3 子 APK 推送怎么控制排序（当前 1.0.7 / 母 1.2）
 
-1.0 只有“全量发布”，所以答案是**能，而且列表顺序和默认服务器都能控制**：
+母 APK 的 `getAllServers()` 只认 `server_order`。所以子 APK 排序不能只靠
+`servers` 数组顺序——部分推送时未勾选的服务器不在 `servers` 里。当前实现额外发
+一个 `orderIds`：
 
 | 信封字段 | 母 APK 写入的 prefs | 效果 |
 |---|---|---|
-| `servers` 数组顺序 | `server_order` = 这个顺序，后面补本地剩余 | 决定切换弹窗里的服务器顺序；第一个就是“排第一” |
-| `lastUsedServerId` | `last_used_server` | 决定 App 启动时加载哪一台 |
+| `orderIds` | `server_order` = 这个顺序（后面补 result 里剩余的 id） | 决定切换弹窗里的完整服务器顺序；`orderIds[0]` 就是“排第一” |
+| `servers` | 各服务器条目 | 只决定本次更新哪些服务器，不再单独决定顺序 |
+| `lastUsedServerId` | `last_used_server` | 只在电视本地没有有效选择时生效；已有本地选择优先 |
 
-子 APK 1.0.5 的 `Publisher` 里：
+子 APK 1.0.7 的 `Publisher`：
 
 ```java
-// servers 按本地 state 的数组顺序写进信封
-clean.put(normalize(s));
-// last = state.lastUsedServerId，若不在列表里则取第一台
-payload.put("lastUsedServerId", last);
+// orderIds 包含所有服务器（含未勾选），按子 APK 列表顺序
+orderIds.put(id);
+payload.put("orderIds", orderIds);
 ```
 
-所以推送会**覆盖**电视上的手动排序和当前选择：
+母 APK `Store.apply` 在 `partial` 合并完成后，用 `orderIds` 重写 `server_order`，
+过滤掉已经删除/不存在的 id，再把 result 里没出现的 id 追加到末尾。这样：
 
-- 想让某台排第一：在子 APK 的 `servers` 数组里把它放最前（当前 UI 没有上移/下移，
-  只能通过添加顺序或直接改 `vault.bin` 实现）。
-- 想让某台成为启动默认：把 `state.lastUsedServerId` 指向它（当前 UI 也没有“设为默认”按钮）。
-- 每次发布都会把电视上手动排好的 `server_order` 和 `last_used_server` 重置为信封里的值。
-
-如果希望“推送只更新账号、不改电视排序”，需要改协议/Store 加显式开关，
-不能靠 `servers` 顺序隐式表达——否则每次发布都会悄悄覆盖用户的手动排序。
+- 子 APK 里点「上移/下移」→ 发布后电视切换弹窗的顺序跟着变。
+- 只勾选一部分更新时，未勾选服务器的位置也会按 `orderIds` 调整，但配置不被改写。
+- 当前正在使用的服务器仍由电视本地 `last_used_server` 优先，推送不会强行换服。
+- 旧母 APK（不认识 `partial`/`orderIds`）会把未勾选项误删，必须先升级电视端。
 
 ---
 
 ## 4. 失败时会不会自动切换
 
-### 原 App 自身（1.0 基线）
+### 原 App 自身
 
 `MainActivity.onCreate`（旧项目 `05-internals/MainActivity.java:45-55`）只做：
 
@@ -189,19 +189,17 @@ if (lastUsedServer == null || !effectiveServerConfig.isLoggedIn()) {
 它会加载 `last_used_server` 指向的那台；这台不可用时**没有跨服务器轮询**。
 每台服务器自己的 `backupRoutes` 是“同一台服务器的备用线路”，不是服务器之间的 failover。
 
-所以 1.0 基线的答案是：**不会自动换服务器**。当前服务器连不上时，
-只会停在这台的错误/未登录流程，需要用户自己打开服务器切换弹窗选另一台。
+### 当前补丁恢复的 failover
 
-### 之前实验过、已回退的 failover
+`app/src/com/dh/myembyapp/sync/Probe.java` 的 `failover()`，由 `SyncProvider.onCreate` 调用：
 
-之前那版补丁在 `SyncProvider` 里加过 `Probe.failover()`：冷启动时如果当前服务器
-TCP/token 探测失败，就按 `server_order` 顺序尝试后面的服务器，3.5 秒预算，成功就写
-`last_used_server`。这段代码已随 1.0 基线回退删除。
-
-如果以后要恢复，建议做成独立开关，并明确：
-- 只在冷启动做一次，运行中掉线不切；
-- 不自动切回第一台；
-- 在 `sync_status.txt` 里记录每次尝试和最终选择。
+- 触发时机：首次运行拉取后，或当前服务器 probe 失败后。
+- 顺序：`server_order` 顺序，从当前服务器之后开始循环尝试。
+- 单台判断：TCP 连通 + `GET /Users/Me` 返回 200；`not-logged-in` / `token-invalid` 跳过。
+- 预算：总 3.5 秒（`700ms TCP + 1000ms HTTP`，受剩余预算约束）。
+- 成功：写 `last_used_server`，首屏直接用新服务器。
+- 失败：保留原 `last_used_server`，不阻塞进入 App。
+- **只在冷启动阶段做一次**；App 运行中服务器掉线不会自动切；也不会自动切回第一台。
 
 ---
 

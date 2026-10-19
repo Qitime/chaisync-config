@@ -11,6 +11,21 @@ public class JSONArray {
     public JSONArray() {
     }
 
+    public JSONArray(String text) {
+        Object o = Json.parse(text);
+        if (!(o instanceof List)) {
+            throw new IllegalArgumentException("根节点不是数组");
+        }
+        Object wrapped = Json.wrap(o);
+        list.addAll(((JSONArray) wrapped).list);
+    }
+
+    public JSONArray(java.util.Collection<?> items) {
+        if (items != null) {
+            list.addAll(items);
+        }
+    }
+
     public JSONArray put(Object v) {
         list.add(v);
         return this;
@@ -35,6 +50,10 @@ public class JSONArray {
             throw new IllegalArgumentException("第 " + i + " 项不是对象");
         }
         return (JSONObject) v;
+    }
+
+    public String optString(int i) {
+        return optString(i, "");
     }
 
     public String optString(int i, String dflt) {

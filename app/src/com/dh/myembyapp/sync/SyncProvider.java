@@ -72,6 +72,8 @@ public final class SyncProvider extends ContentProvider {
         if (firstRun) {
             Probe.journal(ctx, "first run -> blocking fetch");
             pullAndApply(ctx, sync, cfg, cfg.fetchBudgetMs);
+            // 第一次下发多台服务器时，默认那台未必可达；在进入首屏前先找一个能用的
+            Probe.failover(ctx, 700, 1000, 3500);
             return;
         }
 
@@ -85,6 +87,8 @@ public final class SyncProvider extends ContentProvider {
 
         Probe.journal(ctx, "probe failed (" + probe + ") -> repair fetch");
         pullAndApply(ctx, sync, cfg, cfg.fetchBudgetMs);
+        // 拉取失败（镜像全挂/无新配置）时也要在本地多台服务器之间兜底切换
+        Probe.failover(ctx, 700, 1000, 3500);
     }
 
     /* ------------------------------------------------------------------ */

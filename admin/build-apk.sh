@@ -21,8 +21,8 @@ PLATFORM="${PLATFORM_JAR:-$SDK/platforms/android-34/android.jar}"
 
 MIN_SDK=24
 TARGET_SDK=34
-VERSION_NAME="1.0.5"
-VERSION_CODE=6
+VERSION_NAME="1.0.7"
+VERSION_CODE=8
 
 KS="$HERE/build/chaisync-admin.jks"
 KS_ALIAS="chaisync"

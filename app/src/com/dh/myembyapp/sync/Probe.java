@@ -44,6 +44,11 @@ public final class Probe {
         if (srv == null) {
             return "no-server";
         }
+        return checkServer(srv, tcpMs, httpMs);
+    }
+
+    /** 对指定服务器做同样的 TCP + /Users/Me 判断。 */
+    public static String checkServer(JSONObject srv, int tcpMs, int httpMs) {
         String token = srv.optString("accessToken", "");
         String userId = srv.optString("userId", "");
         if (token.isEmpty() || userId.isEmpty()) {
@@ -112,6 +117,105 @@ public final class Probe {
                 }
             }
         }
+    }
+
+    /**
+     * 当前服务器不可用时，按配置顺序尝试后续服务器。
+     *
+     * <p>只在启动阶段调用，而且有总预算：每台服务器最多 tcpMs + httpMs，
+     * 全部失败也不会把开机拖太久。成功即写 last_used_server，
+     * 之后 MainActivity.onCreate 会直接读到新服务器。
+     *
+     * @return 切换到的服务器 id；没有可用服务器时返回 null
+     */
+    public static String failover(Context ctx, int tcpMs, int httpMs, long budgetMs) {
+        try {
+            SharedPreferences sp = ctx.getSharedPreferences(SERVER_PREFS, 0);
+            JSONArray servers = orderedServers(ctx);
+            if (servers.length() <= 1) {
+                return null;
+            }
+            String currentId = sp.getString("last_used_server", "");
+            int start = -1;
+            for (int i = 0; i < servers.length(); i++) {
+                JSONObject o = servers.optJSONObject(i);
+                if (o != null && currentId.equals(o.optString("id", ""))) {
+                    start = i;
+                    break;
+                }
+            }
+
+            long deadline = System.currentTimeMillis() + Math.max(budgetMs, 1000L);
+            for (int step = 0; step < servers.length(); step++) {
+                int idx = start < 0 ? step : (start + step) % servers.length();
+                if (idx == start) {
+                    continue;
+                }
+                int remain = (int) (deadline - System.currentTimeMillis());
+                if (remain < 350) {
+                    Probe.journal(ctx, "failover budget-exhausted");
+                    break;
+                }
+                JSONObject s = servers.optJSONObject(idx);
+                if (s == null) {
+                    continue;
+                }
+                String id = s.optString("id", "");
+                String label = s.optString("alias", s.optString("host", id));
+                String r = checkServer(s,
+                        Math.max(250, Math.min(tcpMs, remain / 2)),
+                        Math.max(300, Math.min(httpMs, remain - 250)));
+                if (r.startsWith("ok")) {
+                    sp.edit().putString("last_used_server", id).commit();
+                    Probe.journal(ctx, "failover -> " + label + " (" + r + ")");
+                    return id;
+                }
+                Probe.journal(ctx, "failover try " + label + " -> " + r);
+            }
+            Probe.journal(ctx, "failover none available");
+            return null;
+        } catch (Throwable t) {
+            Probe.journal(ctx, "failover crashed: " + t.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /** 按 server_order 排序；order 里没有的条目追加到末尾。 */
+    private static JSONArray orderedServers(Context ctx) {
+        JSONArray servers;
+        try {
+            servers = new JSONArray(ctx.getSharedPreferences(SERVER_PREFS, 0)
+                    .getString("servers", "[]"));
+        } catch (Throwable t) {
+            return new JSONArray();
+        }
+        JSONArray order;
+        try {
+            order = new JSONArray(ctx.getSharedPreferences(SERVER_PREFS, 0)
+                    .getString("server_order", "[]"));
+        } catch (Throwable t) {
+            order = new JSONArray();
+        }
+        JSONArray out = new JSONArray();
+        java.util.Set<String> used = new java.util.HashSet<String>();
+        for (int i = 0; i < order.length(); i++) {
+            String id = order.optString(i, "");
+            for (int j = 0; j < servers.length(); j++) {
+                JSONObject o = servers.optJSONObject(j);
+                if (o != null && id.equals(o.optString("id", ""))) {
+                    out.put(o);
+                    used.add(id);
+                    break;
+                }
+            }
+        }
+        for (int j = 0; j < servers.length(); j++) {
+            JSONObject o = servers.optJSONObject(j);
+            if (o != null && !used.contains(o.optString("id", ""))) {
+                out.put(o);
+            }
+        }
+        return out;
     }
 
     /** 当前生效服务器：last_used_server 指向的那条，找不到就取第一条 */

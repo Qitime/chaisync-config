@@ -149,7 +149,7 @@ node tools/publish.mjs verify --in dist/config.enc.example.json \
 | 场景 | 电脑（本目录） | 手机（`admin/`） |
 |---|---|---|
 | 改账号 | 编辑 `config.json` → `publish` → push | App 里改 → 点「发布」 |
-| 刷令牌 | `node tools/publish.mjs refresh` | 点「刷新全部令牌」 |
+| 刷令牌 | `node tools/publish.mjs refresh` | 勾选后点「刷新选中」 |
 | 首次配置 | `genkey` + 写 config | 粘贴一次 bootstrap JSON |
 
 关键区别只有一条：**发布私钥不在 APK 里**。母 APK 放 `master` 是安全的（只能解、不能伪造），
@@ -157,7 +157,7 @@ node tools/publish.mjs verify --in dist/config.enc.example.json \
 所以它走"首次导入 + AndroidKeyStore 加密存盘"，代价是换手机不能靠备份迁移。
 
 ```bash
-bash admin/build-apk.sh     # → admin/dist/ChaiSync-admin-1.0.5.apk（46 KiB，零 Gradle）
+bash admin/build-apk.sh     # → admin/dist/ChaiSync-admin-1.0.7.apk（53 KiB，零 Gradle）
 bash admin/run-tests.sh     # 协议回归测试，不需要设备
 ```
 
@@ -180,6 +180,23 @@ bash admin/run-tests.sh     # 协议回归测试，不需要设备
 
 拉取时按 `mirrors` 顺序逐个试，每个响应都过一遍 `Envelope.open()`：
 验签失败或被判 rollback 就换下一个源，全挂才保留本地。
+
+---
+
+## 电视端：沿用原 App 切换 + 启动故障转移
+
+母 APK 顶栏本来最左侧就有 `ServerButton`（服务器图标 + 名字），右边是
+媒体 / 收藏 / 搜索 / 设置；点它打开原 App 的「切换服务器」弹窗。本补丁
+**不叠加圆点，也不改顶栏布局**，只把子 APK 的排序结果写进 `server_order`。
+
+**启动故障转移**：`SyncProvider` 探测当前服务器失败（TCP 不通 / token 无效）时，
+会按 `server_order` 顺序尝试后面的服务器，最多 3.5 秒；第一台能用就写 `last_used_server`，
+首屏直接用它。拉取新配置失败、只能留本地时也会走这一步。健康启动不会触发，也不会多花时间。
+运行中掉线不会自动切；下次冷启动才会。
+
+> **兼容性**：子 APK 1.0.7 的「部分推送 + 排序」依赖母 APK 1.1+ 的
+> `partial` / `orderIds` 语义（当前构建 1.2）。旧母 APK 会把未勾选的服务器当成“已删除”。
+> **先升级电视端，再用子 APK 做部分推送。**
 
 ---
 
@@ -252,6 +269,8 @@ adb shell cat /sdcard/Android/data/com.dh.myembyapp/files/sync_status.txt
    缓解办法：多放几个；或者让信封正文里也带一份 `mirrors`，客户端每次成功拉取后自我更新。
 5. **打包链路未在本机端到端跑过**。`apktool / d8 / zipalign / apksigner` 沿用旧项目已验证的流程，
    但这一版没有实机验证；第一次跑请留意 `[4/7] javac` 与 `[5/7] splice` 两处的输出。
+6. **故障转移只在启动时做一次**。运行中服务器掉线不会自动切；下次冷启动才会。
+7. **排序通过 `orderIds` 重写 `server_order`**。子 APK 每次发布都会按自己的列表顺序覆盖电视上的排序；当前选择中的服务器仍由原 App 本地优先，不会被推送强行改掉。
 
 ---
 
