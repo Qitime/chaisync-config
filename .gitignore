@@ -1,0 +1,47 @@
+# 明文配置（含密码 / accessToken）绝不入库
+config/config.json
+
+# 密钥与打包签名
+keys/
+*.pem
+*.b64
+*.keystore
+*.jks
+
+# 构建中间产物
+build/classes/
+build/decoded/
+build/dexout/
+build/patch.jar
+build/*.apk
+build/*.idsig
+build/env.json
+
+# 子 APK 的构建产物
+admin/build/
+admin/dist/
+
+# 子 APK 的 bootstrap（含发布私钥，绝不能进 git）
+bootstrap*.json
+bootstrap*.html
+
+# 安装包不进库（仓库是公开的，别把它变成分发渠道）
+dist/*.apk
+dist/*.idsig
+
+# 发布产物 dist/config.enc.json 是要入库的，别忽略
+
+# 生产密钥（绝不能入库）
+keys-prod/
+
+# 反编译/逆向临时产物
+build/jadx-out/
+build/*.json
+build/verify-out/
+build/work-*/
+build/*.png
+build/*.xml
+build/*.hex
+
+# 构建期注入的密钥配置（含 master，绝不入库）
+app/assets/sync_config.json

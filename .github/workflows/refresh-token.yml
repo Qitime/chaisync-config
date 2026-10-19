@@ -1,0 +1,77 @@
+name: publish-config
+
+# 替代 Cloudflare Worker 的两个职责：代刷 Emby 令牌 + 发布配置。
+# 仓库里只有密文（dist/config.enc.json）；明文与密钥全部来自 Secrets。
+#
+# 需要的 Secrets：
+#   CONFIG_JSON  完整的明文配置 JSON（就是本地 config/config.json 的内容）
+#   MASTER_B64   主密钥（keys/master.b64 的内容）
+#   SIGNING_KEY  ECDSA 私钥（keys/signing.pem 的内容，含 BEGIN/END 行）
+#
+# 提醒：公开仓库的 Actions 日志对所有人可见。所以这里不开 set -x，
+#      也不 echo 任何与凭据有关的值。GitHub 的自动打码只认精确匹配，
+#      base64/拼接后的形式照样会漏。
+
+on:
+  schedule:
+    - cron: '0 20 * * 0'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: '触发原因（只写进 commit message）'
+        required: false
+        default: 'manual'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-config
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Assemble plaintext config from secret
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          mkdir -p config
+          printf '%s' "$CONFIG_JSON" > config/config.json
+          node -e "const c=JSON.parse(require('fs').readFileSync('config/config.json','utf8')); console.log('servers=' + (c.servers||[]).length);"
+
+      - name: Refresh Emby tokens and publish envelope
+        env:
+          MASTER_B64: ${{ secrets.MASTER_B64 }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/signing.pem"
+          node tools/publish.mjs refresh \
+            --in config/config.json \
+            --out dist/config.enc.json \
+            --key "$RUNNER_TEMP/signing.pem" \
+            --master "$MASTER_B64" \
+            --kid k1
+
+      - name: Commit ciphertext only
+        run: |
+          rm -f config/config.json "$RUNNER_TEMP/signing.pem"
+          git config user.name  "chaisync-bot"
+          git config user.email "bot@users.noreply.github.com"
+          if git diff --quiet -- dist/; then
+            echo "no change in dist/, nothing to commit"
+            exit 0
+          fi
+          SEQ=$(node -p "require('./dist/config.enc.json').seq")
+          git add dist/config.enc.json
+          git commit -m "config: seq ${SEQ} (${{ github.event.inputs.reason || 'scheduled' }})"
+          git push

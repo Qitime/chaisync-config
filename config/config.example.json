@@ -1,0 +1,52 @@
+{
+  "kind": "accounts",
+  "mode": "sync",
+  "lastUsedServerId": "srv-main",
+  "servers": [
+    {
+      "id": "srv-main",
+      "alias": "主账号",
+      "protocol": "https",
+      "host": "media.example.com",
+      "port": 443,
+      "path": "",
+      "username": "qiqi",
+      "password": "PUT_REAL_PASSWORD_HERE",
+      "userId": "",
+      "accessToken": "",
+      "deviceId": null,
+      "lastLoginTime": 0,
+      "isVerified": false,
+      "directOnly": false,
+      "enableStrmDirectPlay": true,
+      "useEmbyPrefix": false,
+      "trustAllCerts": false,
+      "backupRoutes": [],
+      "activeBackupRouteId": null,
+      "note": ""
+    },
+    {
+      "id": "srv-backup",
+      "alias": "备用账号",
+      "protocol": "https",
+      "host": "backup.example.com",
+      "port": 443,
+      "path": "emby",
+      "username": "qiqi",
+      "password": "PUT_REAL_PASSWORD_HERE",
+      "userId": "",
+      "accessToken": "",
+      "deviceId": null,
+      "lastLoginTime": 0,
+      "isVerified": false,
+      "directOnly": false,
+      "enableStrmDirectPlay": true,
+      "useEmbyPrefix": false,
+      "trustAllCerts": false,
+      "backupRoutes": [],
+      "activeBackupRouteId": null,
+      "note": ""
+    }
+  ],
+  "removedIds": []
+}
