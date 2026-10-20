@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "alg": "A256GCM+ES256",
+  "kid": "k1",
+  "seq": 1,
+  "iat": 1792472771,
+  "n1": "W0aE5DZ_wXTibNkX",
+  "wdek": "cNys8Jw3KXkyqYncl847XZrXoEc9dCYIe84MpEN9YAMTi7ibEvXBP-_QK9MUPZjO",
+  "n2": "2IW9P_F5ZSZR5lNa",
+  "ct": "kW-Kz4eLw4gR9_X3y6HRNe53hUy-wKjsT32mXYt23ZvAGN97m384Q6bU8O_Bc_cuSG3zJIqKLlhvdTLpr1vXZkcbLiPF5IYhXcWhYtPjy_6sbAt8NjPtFfUcz7oGQuryWE8ltVbXZe0XOSdHyeWSW9pQsLzgWXPZDIbMPPb5d8HmiZo4VV5dRDgPCT8cCBFyN3DSD47-JoBlWfQw_CnMcagaEbAvKmj-VkzwT7sKztQzGndjH9EnAMiUHCcYOnOqgHGzkCahlaGaXcRLYeNwq8ZOEPieI358IeQtpZHnhxRyzASOGLh-qP0hcjIgb4oiMyo_lVVsCiaZNExo2MyZReTQGpvHkd-wZ5IGgn1zxcKv3vn_utQAJR4iiebGGWd2W-s",
+  "sig": "MEYCIQC7Go9kqVDy6Uxx9kdWF4s1kJgp-YptdcFyi0Y3bKbl6wIhANumtx3oBBwPFIQ3Vp7mBu-2tqz8ACz0Zs67ca1UmgwQ"
+}
