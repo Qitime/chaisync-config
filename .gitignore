@@ -11,6 +11,7 @@ keys/
 # 构建中间产物
 build/classes/
 build/decoded/
+build/cache/
 build/dexout/
 build/patch.jar
 build/*.apk
@@ -39,6 +40,12 @@ build/jadx-out/
 build/*.json
 build/verify-out/
 build/work-*/
+
+# 逆向分析工作区（全量产物 >1 GB，可重跑；结论已归档到 docs/reverse/）
+build/old-0.2.6/
+build/cmp-031/
+build/new-1.2/
+build/device-check/
 build/*.png
 build/*.xml
 build/*.hex

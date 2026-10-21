@@ -29,7 +29,9 @@ $apktool   = "D:\Ai\tools\apkrev-tools\apktool\apktool.jar"
 $tools     = "D:\Ai\Android\sdk\build-tools\37.0.0"
 $androidJar = "D:\Ai\Android\sdk\platforms\android-36\android.jar"
 $adb       = "D:\Tv\QtScrcpy-win-x64-v3.3.3\adb.exe"
-$ks        = Join-Path $work 'chaichai.keystore'
+$ks        = Join-Path $work 'xemby.keystore'
+$brandIcon   = Join-Path $work 'branding\xemby_icon_1024.png'
+$brandBanner = Join-Path $work 'branding\xemby_banner_1280.png'
 
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $work 'classes') | Out-Null
@@ -60,11 +62,20 @@ if (-not (Test-Path $decodedPath)) {
 
 $manifest = Join-Path $decodedPath 'AndroidManifest.xml'
 $txt = Get-Content $manifest -Raw -Encoding UTF8
+$mChanged = $false
 if ($txt -notmatch 'com\.dh\.myembyapp\.sync\.SyncProvider') {
     $provider = '    <provider android:name="com.dh.myembyapp.sync.SyncProvider" android:authorities="com.dh.myembyapp.sync.provider" android:exported="false" android:initOrder="1000" />' + "`n"
     $txt = $txt.Replace('</application>', $provider + '</application>')
+    $mChanged = $true
+}
+# 应用名改成字面量：只动 manifest，不碰 resources.arsc
+if ($txt.Contains('android:label="@string/app_name"')) {
+    $txt = $txt.Replace('android:label="@string/app_name"', 'android:label="Xemby"')
+    $mChanged = $true
+}
+if ($mChanged) {
     [System.IO.File]::WriteAllText($manifest, $txt, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host "[2/7] manifest patched"
+    Write-Host "[2/7] manifest patched (provider / label=Xemby)"
 } else {
     Write-Host "[2/7] manifest already patched"
 }
@@ -81,23 +92,29 @@ if ($LASTEXITCODE -ne 0) { throw 'javac failed' }
 & (Join-Path $tools 'd8.bat') --min-api 23 --lib $androidJar --output (Join-Path $work 'dexout') (Join-Path $work 'patch.jar') | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'd8 failed' }
 
-Write-Host "[5/7] splice + zipalign"
+Write-Host "[5/7] splice + brand + zipalign"
 $dex = Join-Path $work 'dexout\classes.dex'
 if (-not (Test-Path $dex)) { throw 'd8 produced no classes.dex' }
 & python (Join-Path $PSScriptRoot 'splice.py') $Apk $patchedApk $dex $assetPath (Join-Path $work 'final-unaligned.apk')
 if ($LASTEXITCODE -ne 0) { throw 'splice failed' }
+if ((Test-Path $brandIcon) -and (Test-Path $brandBanner)) {
+    & python (Join-Path $PSScriptRoot 'zipswap.py') (Join-Path $work 'final-unaligned.apk') $patchedApk `
+        $brandIcon $brandBanner (Join-Path $work 'final-branded.apk')
+    if ($LASTEXITCODE -ne 0) { throw 'brand swap failed' }
+    Move-Item -Force (Join-Path $work 'final-branded.apk') (Join-Path $work 'final-unaligned.apk')
+}
 & (Join-Path $tools 'zipalign.exe') -p -f 4 (Join-Path $work 'final-unaligned.apk') (Join-Path $work 'final-aligned.apk')
 if ($LASTEXITCODE -ne 0) { throw 'zipalign failed' }
 
 Write-Host "[6/7] apksigner"
 if (-not (Test-Path $ks)) {
-    & keytool -genkeypair -keystore $ks -alias chaichai -keyalg RSA -keysize 2048 -validity 10000 `
-        -storepass chaichai123 -keypass chaichai123 `
-        -dname "CN=ChaiSync, OU=Dev, O=Personal, L=City, ST=State, C=CN" | Out-Null
+    & keytool -genkeypair -keystore $ks -alias xemby -keyalg RSA -keysize 2048 -validity 10000 `
+        -storepass xemby2026 -keypass xemby2026 `
+        -dname "CN=Xemby, OU=Dev, O=Xemby, L=City, ST=State, C=CN" | Out-Null
 }
-$outApk = Join-Path $work 'chaichai-sync.apk'
-& (Join-Path $tools 'apksigner.bat') sign --ks $ks --ks-key-alias chaichai `
-    --ks-pass pass:chaichai123 --key-pass pass:chaichai123 `
+$outApk = Join-Path $work 'Xemby-tv.apk'
+& (Join-Path $tools 'apksigner.bat') sign --ks $ks --ks-key-alias xemby `
+    --ks-pass pass:xemby2026 --key-pass pass:xemby2026 `
     --out $outApk (Join-Path $work 'final-aligned.apk')
 if ($LASTEXITCODE -ne 0) { throw 'apksigner failed' }
 

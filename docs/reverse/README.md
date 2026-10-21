@@ -1,13 +1,14 @@
 # 柴柴 Emby TV 0.3.1-alpha3 反编译归档
 
 归档目的：把母 APK 顶栏、服务器切换、服务器排序相关的反编译结果留在仓库里，
-以后改注入代码时不用每次重新拆包。
+以后改注入代码时不用每次重新拆包；同时留下"这套包能不能改、难点在哪"的量化结论。
 
 > **当前仓库状态**：子 APK 1.0.7 + 母 APK 1.2。
 > 保留勾选/部分推送、`orderIds` 排序、启动故障转移；**不再包含顶栏圆点**。
 
 - 源 APK：`C:\Users\qiqi\Downloads\ChaiChaiEmbyTV-0.3.1-alpha3-arm64-v8a.apk`
-- 反编译对象：`build/decoded/classes4.dex`（UI / 业务逻辑主要在 classes4）
+- 反编译范围：全部 5 个 dex。业务逻辑主要在 classes3 / classes4，
+  **详情页 UI 在 classes.dex**（`defpackage.ra0`，4.4 MB）
 - 工具：jadx 1.5.6，`--no-res`
 - 归档文件：`docs/reverse/jadx/`，文件名后缀标了原始类名与用途
 
@@ -21,11 +22,50 @@ java -jar D:/Ai/tools/apkrev-tools/apktool/apktool.jar d -f -s \
 # 2. 反编译 classes4（约 2 分钟）
 D:/Ai/tools/apkrev-tools/jadx/bin/jadx.bat \
   -d build/jadx4 --no-res -j 4 build/decoded/classes4.dex
+
+# 2b. 全量反编译 5 个 dex（可逆向性数据用这个，约 1 分钟）
+D:/Ai/tools/apkrev-tools/jadx/bin/jadx.bat \
+  -d build/cmp-031/jadx031 --no-res --threads-count 8 \
+  "C:/Users/qiqi/Downloads/ChaiChaiEmbyTV-0.3.1-alpha3-arm64-v8a.apk"
 ```
 
 > 反编译代码里的 `defpackage.ya2`、`hr0`、`so0` 是混淆名；
 > 文件里的 `ComposerKt.traceEventStart(... "xxx.kt:line")` 保留了原始源码文件名和行号，
 > 这是定位 UI 逻辑最可靠的线索。
+
+---
+
+## 0. 可逆向性评估（动手前先读）
+
+2026-10-19 用同一套 jadx 参数把 **0.2.6** 和 **0.3.1-alpha3** 全量反编译后做了量化对比。
+结论：**0.3.1 没有任何加密或加固，代码完整度反而更高**；改功能变难的真正原因是
+R8 的类合并（class merging），不是加密。
+
+| 指标 | 0.2.6 | 0.3.1-alpha3 |
+|---|---|---|
+| 应用类反编译成功 | 211 / 214（98.6%） | **328 / 330（99.4%）** |
+| 业务目录含失败方法的文件 | — | **只有 1 个** |
+| 业务代码 import 指向混淆包 | 1.1% | **16.1%** |
+| 方法最多的合并类 | 308 方法 / 1.5 MB（`d0/s2`） | **950 方法 / 4.4 MB（`ra0`）** |
+| 混淆类的包结构 | 46 个短包 / 503 文件 | 2,708 文件全在 `defpackage` |
+| 详情页（`DetailScreen.kt`） | 0.8 MB / 44 个类 | **4.9 MB / 27 个类** |
+
+要点：
+
+- `DetailScreen.kt` 的全部 UI 逻辑被合并进 `defpackage/ra0.java`（60,847 行 / 950 方法）。
+- 其中 **7 个巨型 Composable** jadx 反编译不出方法体（`ra0.A/L/d/e/f/k1/x1`），只能看 smali。
+- 定位 UI **不要按类名**，搜 `DetailScreen.kt:1704` 这种 trace 字符串。
+  49 个组件的索引见 [`jadx/ra0_DetailScreen_索引.md`](jadx/ra0_DetailScreen_索引.md)。
+- 完整数据、分层可改性、复现命令见 [`可逆向性对比.md`](可逆向性对比.md)。
+
+```bash
+# 重新量化（需要先有 jadx 产物）
+python docs/reverse/scripts/reverse_audit.py \
+  --old build/old-0.2.6/ChaichaiEmby-0.2.6-original.apk \
+  --new build/cmp-031/v031.apk \
+  --old-src build/old-0.2.6/jadx/sources \
+  --new-src build/cmp-031/jadx031/sources
+```
 
 ---
 
@@ -215,3 +255,8 @@ if (lastUsedServer == null || !effectiveServerConfig.isLoggedIn()) {
 | `jadx/x5_ServerSortDialog.java` | `defpackage.x5` | 服务器排序弹窗 |
 | `jadx/ServerPreferences.java` | `com.dh.myembyapp.data.preferences.ServerPreferences` | 服务器存取、`server_order`、`last_used_server` |
 | `jadx/ServerConfig.java` | `com.dh.myembyapp.data.model.ServerConfig` | 服务器数据模型（含 deviceId / token / backupRoutes） |
+| `jadx/ra0_DetailScreen.java` | `defpackage.ra0` | 详情页全部 UI（4.4 MB / 60,847 行 / 950 方法） |
+| `jadx/ra0_DetailScreen_索引.md` | — | 49 个 Composable 的原始名+行号；7 个无法反编译的方法 |
+| `jadx/DanmakuSettingsManager.java` | `com.dh.myembyapp.data.DanmakuSettingsManager` | 业务类可读性样例（`@Metadata` 参数名完整） |
+| `可逆向性对比.md` | — | 0.2.6 vs 0.3.1 的完整量化对比与分层结论 |
+| `scripts/reverse_audit.py` | — | 可复现的评估脚本（dex 解析 + jadx 产物统计） |

@@ -127,6 +127,10 @@ public class JSONObject {
         return m.size();
     }
 
+    public java.util.Iterator<String> keys() {
+        return m.keySet().iterator();
+    }
+
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder();

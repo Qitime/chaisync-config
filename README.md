@@ -82,7 +82,9 @@ powershell -ExecutionPolicy Bypass -File .\build\build.ps1 `
   -RawBase   "https://raw.githubusercontent.com/<你>/<仓库>/main/dist/config.enc.json"
 ```
 
-产物 `build/chaichai-sync.apk`。装之前必须先卸载原版（重签名会变，数据会被清空）。
+产物 `dist/Xemby-tv-1.2.apk`。**签名是 Xemby 自己的 keystore（`build/xemby.keystore`），
+和原版柴柴不通用**——同包名只能覆盖升级同签名的包，所以这份刻意用了 `com.xemby.tv` 包名，
+可以和柴柴并存安装。要出同包名的替换版，不传 `PKG` 即可。细节见下面「品牌：Xemby」。
 
 ---
 
@@ -116,7 +118,11 @@ tools/bootstrap.mjs   生成给手机端导入的 bootstrap JSON（含私钥，�
 tools/make-bootstrap-page.mjs  把 bootstrap JSON 变成可一键复制的一页 HTML
 tools/precommit.sh    拦住明文凭据进 git（强烈建议装）
 build/build.ps1       重打包：只替换 manifest + assets，追加一个 classes6.dex，其余字节原样
+build/build-gh.sh     同上，bash 版（本机实际用的是这个）
 build/splice.py       拼包脚本：原 APK 全量保留，.so 保持 uncompressed + 页对齐
+build/zipswap.py      只换 manifest / 图标 / banner，其余字节原样搬（换肤用）
+build/retarget.py     换包名做共存版：只改 package / authority / 自定义权限，组件类名不动
+build/branding/       Xemby 品牌图与生成脚本
 
 admin/                手机端发布 App（可选，见 admin/README.md）
   src/…/EnvelopeSeal.java  封装端；与母 APK 的 Envelope 字节同构
@@ -131,8 +137,94 @@ dist/config.enc.example.json 示例产物（假账号，用来验证本地链路
 config/config.json           明文配置（不入库）
 ```
 
-**先自测一下链路**（不联网、不改任何东西，只验证密钥对得上）：
+---
 
+## 品牌：Xemby
+
+母 APK 换成了自己的脸：应用名 **Xemby**、新图标、新 TV banner、新签名。
+
+| 项 | 落在哪 | 怎么改 |
+|---|---|---|
+| 应用名 | `AndroidManifest.xml` 的 `android:label` **字面量** | 直接写 `Xemby`，不动 `resources.arsc`：所有语言显示一致，也不会因为重建资源表而打乱其它资源 ID |
+| 图标 | `res/Y0.png`（= `@drawable/chaichai`） | 生成新图 → `zipswap.py` 只换这个条目的字节，资源名和 ID 都不变 |
+| TV banner | `res/kK.png`（= `@drawable/chaichai_b`） | 同上 |
+| 签名 | `build/xemby.keystore`，alias `xemby`，密码 `xemby2026` | **丢了就不能覆盖升级**，只能换包名重来；`.gitignore` 已排除，自己备份 |
+
+设计取向：TV 桌面是深色大网格，图标要"安静但不含糊"——深色圆角底、单一绿色主体、
+中心一个播放三角点题。主体占画布 61%，就算被桌面按圆形裁切也切不到笔画；放进一排彩色
+图标里不抢眼，但对比度足够，两米外仍能认出是 X。
+
+重新生成（改颜色 / 改比例都在脚本顶部）：
+
+```bash
+python build/branding/make_brand.py
+# → build/branding/xemby_icon_1024.png  1024×1024 应用图标
+# → build/branding/xemby_banner_1280.png 1280×720 TV banner
+```
+
+换完图重打包即可，`build-gh.sh` 的 `[6/7]` 会自动做替换；只想给已签好的包换皮、不想重编译资源时：
+
+```bash
+python build/zipswap.py 旧包.apk 重编译得到的apk 图标.png banner.png 输出.apk
+```
+
+> 因为签名换了，**同包名的包不能覆盖安装旧版**：`adb uninstall com.dh.myembyapp` 之后再装。
+
+### 构建缓存（改 Java 只要 ~25 秒，不再每次重解码）
+
+| 目录 | 内容 | 失效条件 |
+|---|---|---|
+| `build/decoded/` | `apktool d -s` 的解码基座 | 源 APK 或 `apktool.jar` 的 sha256 变化（自动重解） |
+| `build/cache/patched.apk` | `apktool b` 的产物（已注入 `SyncProvider`、已改 label、已按 `PKG` retarget） | 源包 / apktool / `PKG` / 解码树指纹 任一变化 |
+
+`build/decoded/.manifest.orig` 存着**原始清单**，每次构建前无条件还原——
+旧写法是"编译成功后才还原"，中途失败会把 `SyncProvider` 和 `label="Xemby"` 留在基座里，
+下次构建就在脏基座上继续改。
+
+- 只改 `app/src/**/*.java` → 两步都命中，只跑 javac/d8 + 拼包 + 签名。
+- 手改过 `build/decoded/res/` 里的资源 → 指纹变化自动重建；强制重建用 `FORCE_BUILD=1`。
+- 换源 APK → 自动重新解码；强制解码用 `FORCE_DECODE=1`。
+- `build/decoded` 与 `Movie/emby-apk/build/decoded` 出自同一个母包 + 同一个 apktool，**内容等价、可直接互拷**。
+- `work-*` 只保留最近 3 个。
+
+### 要跟原版柴柴并存：换包名
+
+签名只决定"能不能覆盖升级"，**决定"是不是同一个应用"的是包名**。想装第二份、又不动原来那个，
+只能改包名。构建时给一个 `PKG` 即可：
+
+```bash
+PKG=com.xemby.tv OUT=dist/Xemby-tv-1.2.apk bash build/build-gh.sh "<MASTER>" "<PUBKEY>" "<RAW_URL>"
+```
+
+`retarget.py` 只改这几处，其余一概不动：
+
+| 改 | 值 |
+|---|---|
+| `package` 属性 | `com.xemby.tv` |
+| 自定义签名级权限 | `com.xemby.tv.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` |
+| 三个 authority | `.sync.provider` / `.fileprovider` / `.androidx-startup` |
+
+**组件类名必须保持 `com.dh.myembyapp.*`**（`MainActivity` / `MyEmbyApp` / `DlnaService` /
+`SyncProvider`）——它们在 dex 里就是全限定名，改了等于指向不存在的类，装上去直接闪退。
+authority 必须换，否则两个包抢同一个 authority，安装会报 `INSTALL_FAILED_CONFLICTING_PROVIDER`。
+
+换包名之后：
+
+- 数据目录变成 `/sdcard/Android/data/com.xemby.tv/files/sync_status.txt`（代码用的是
+  `getExternalFilesDir`，自动跟着包名走，不用改 Java）
+- prefs 是独立的一套，首次启动走"从没同步过"的阻塞拉取，≤9 秒把配置写进来
+- 桌面（leanback banner 或第三方 TV launcher）里两项并存，图标和名字各是各的
+
+两个产物的区别：
+
+| 文件 | 包名 | 用途 |
+|---|---|---|
+| `dist/Xemby-tv-1.2.apk` | `com.xemby.tv` | **共存版**，和柴柴各装各的 |
+| `dist/Xemby-tv-1.2-samepkg.apk` | `com.dh.myembyapp` | 同包名版，会顶掉柴柴（需先卸载） |
+
+---
+
+**先自测一下链路**（不联网、不改任何东西，只验证密钥对得上）：
 ```bash
 node tools/publish.mjs verify --in dist/config.enc.example.json \
      --pub keys/pubkey.hex --master "$(cat keys/master.b64)"
