@@ -32,10 +32,12 @@
 ### 1. 生成密钥（只做一次）
 
 ```bash
-node tools/publish.mjs genkey --out keys
+node tools/publish.mjs genkey --out keys-prod   # 线上那套；本地演练用 --out keys
 ```
 
 记下输出的两个值，后面构建要用：`PUBKEY_HEX`（公钥，钉进 APK）、`MASTER_B64`（主密钥）。
+但**不要再手抄这两个值去打包**——`build-gh.sh --keys keys-prod` 会直接从目录里读，
+从根上消除"抄错一个字符"和"抄了另一个目录"这两类事故（见「密钥目录」）。
 
 `keys/signing.pem` 是签名私钥，**绝不能入库**（`.gitignore` 已排除）。
 
@@ -76,15 +78,53 @@ git add dist/config.enc.json && git commit -m "config: seq N" && git push
 ### 5. 打包 APK
 
 ```powershell
+# 推荐：只给密钥目录，公钥与 master 从目录里读，不会出现两处手抄对不上
+powershell -ExecutionPolicy Bypass -File .\build\build.ps1 -KeyDir keys-prod
+```
+
+```bash
+# bash 版（本机实际用这个）
+bash build/build-gh.sh --keys keys-prod
+```
+
+老写法仍然可用（显式传三个值），但**不推荐**，见下面的「密钥目录」一节：
+
+```powershell
 powershell -ExecutionPolicy Bypass -File .\build\build.ps1 `
-  -MasterB64 "<MASTER_B64>" `
-  -PubKeyHex "<PUBKEY_HEX>" `
+  -MasterB64 "<MASTER_B64>" -PubKeyHex "<PUBKEY_HEX>" `
   -RawBase   "https://raw.githubusercontent.com/<你>/<仓库>/main/dist/config.enc.json"
 ```
 
 产物 `dist/Xemby-tv-1.2.apk`。**签名是 Xemby 自己的 keystore（`build/xemby.keystore`），
 和原版柴柴不通用**——同包名只能覆盖升级同签名的包，所以这份刻意用了 `com.xemby.tv` 包名，
 可以和柴柴并存安装。要出同包名的替换版，不传 `PKG` 即可。细节见下面「品牌：Xemby」。
+
+### 密钥目录：`keys/` vs `keys-prod/`
+
+**线上信封是 `keys-prod/` 签发的。** 打母 APK 必须用 `keys-prod/`，这是唯一正确的来源。
+
+| 目录 | 用途 | 能签线上信封吗 |
+|---|---|---|
+| `keys-prod/` | **线上发布**：`dist/config.enc.json` 由它签发，`dist/bootstrap.json` 里钉的也是它 | ✅ 是 |
+| `keys/` | 本地演练 / 协议回归测试（`admin/run-tests.sh`、`admin/build/env.json`） | ❌ 否 |
+
+两者不可互换。2026-10-21 的 1.3 就是拿 `keys/` 打出来的：三个镜像都能 200 拿到信封，
+但每一封都被 `bad-signature` 拒掉，电视端只会在 `sync_status.txt` 里留一行 reject，
+然后静默保留旧配置进首页——看起来像「加载完就跳过同步」，极难排查。
+
+所以现在 `build-gh.sh` / `build.ps1` 在**签名后自动跑** `tools/check-keys.mjs`：
+从刚打好的 APK 里读出 `assets/sync_config.json`，用它去解一次线上信封，
+对不上就 `exit 1`。也可以单独跑：
+
+```bash
+node tools/check-keys.mjs --apk dist/Xemby-tv-1.3.apk
+node tools/check-keys.mjs --apk dist/Xemby-tv-1.3.apk --env dist/config.enc.json   # 用本地信封
+```
+
+离线排障时 `SKIP_KEY_CHECK=1`（bash）/ `-SkipKeyCheck`（ps1）可跳过，**发版别用**。
+
+> `keys/` 与 `keys-prod/` 都在 `.gitignore` 里，不进版本库。丢了 `keys-prod/signing.pem`
+> 就再也签不出电视端认的信封，只能 `genkey` 重来并**重打所有 APK**——请自行备份。
 
 ---
 
@@ -95,7 +135,8 @@ powershell -ExecutionPolicy Bypass -File .\build\build.ps1 `
 | 改账号 / 加账号 | 改 `config/config.json` → 跑 `publish` → push |
 | token 过期（电视提示登录） | 跑 `refresh` → push |
 | 换服务器地址 | 改 `host` → 跑 `publish` → push |
-| 换主密钥 | `genkey --out keys2` → 重新 `publish` → **重打包 APK**（主密钥在 APK 里） |
+| 换主密钥 | `genkey --out keys2` → 重新 `publish` → **重打包 APK**（主密钥在 APK 里）；打包时 `--keys keys2` |
+| 换签名私钥（不动 master） | 只需重发信封；但 APK 里的 `pubKeyHex` 也钉死了签名公钥，**同样要重打包** |
 | 全自动（可选） | 启用 `.github/workflows/refresh-token.yml`，见文件头注释里的三个 Secrets |
 
 发布之后**最多 5 分钟**才会全网可见（raw 有 `Cache-Control: max-age=300`）。这不是失败，
@@ -350,9 +391,10 @@ adb shell cat /sdcard/Android/data/com.dh.myembyapp/files/sync_status.txt
 | `probe failed (tcp-fail...)` | 服务器换了/挂了/端口被封（ConnectException / UnknownHost / connect 超时） | 正常流程，会去拉新配置 |
 | `probe failed (token-invalid:401)` | token 失效 | 跑 `refresh` 重新发布 |
 | `verified via=... seq=N` | 成功 | — |
-| `bad-signature` | 签名不对：镜像篡改，或 APK 里的公钥与发布端不匹配 | 核对 `-PubKeyHex` 与 `keys/pubkey.hex` |
-| `bad-master` | 主密钥不对 | 核对 `-MasterB64` |
+| `bad-signature` | 签名不对：镜像篡改，或 APK 里的公钥与发布端不匹配 | **先跑 `node tools/check-keys.mjs --apk <包>`**；多半是打包用错密钥目录（`keys/` 而不是 `keys-prod/`） |
+| `bad-master` | 主密钥不对 | 同上，`check-keys.mjs` 会一起验；确认用的是 `keys-prod/master.b64` |
 | `rollback` | 拿到的 seq 不比本地新（通常是 CDN 缓存还没刷新） | 等 5 分钟；持续发生说明 `seq` 没递增 |
+| `fetch-failed \|...:bad-signature` + 静默进首页 | 三个镜像全被验签拒绝，保留本地旧配置 | 就是 1.3 那个事故，见「密钥目录」 |
 | `bad-json` | 拿到 HTML 错误页或被截断 | 换镜像；检查 `RawBase` 拼写 |
 | `fetch-failed \|...` | 所有镜像都失败 | 看后面跟的每一条 |
 | `budget-exhausted` | 9 秒预算用光 | 正常降级，用本地配置进入 |

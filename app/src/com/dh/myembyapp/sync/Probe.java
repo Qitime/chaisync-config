@@ -46,12 +46,36 @@ public final class Probe {
     }
 
     /**
+     * 能否把请求交给这台服务器。
+     *
+     * <p>注意 {@link #checkServer} 的 "ok" 语义是"<b>配置没坏</b>"，不是"<b>能用</b>"：
+     * 5xx 会被判成 {@code ok(http 500)}（服务器活着，只是这台后端挂了），读超时会被判成
+     * {@code ok(http-slow)}。这两个结论用来决定"要不要重新拉配置"是对的，用来决定
+     * "把用户切到哪台服务器"是错的——切过去只会得到一个 500 或者一直转圈。
+     *
+     * <p>所以故障转移单独用这个更严的口径：只有 200 和 401/403（端口和 HTTP 栈都活着，
+     * 只是凭据不对）才算可用；5xx / http-slow / tls-fail / tcp-fail 都不选。
+     */
+    private static boolean healthy(String result) {
+        if (result == null) {
+            return false;
+        }
+        if ("ok".equals(result)) {
+            return true;
+        }
+        return result.startsWith("token-invalid:");
+    }
+
+    /**
      * 对指定服务器做健康判断。
      *
      * <p>只有一次 HTTP 请求（GET /Users/Me），不再先发一个裸 TCP 探测：
      * HTTP 的连接阶段本身就携带 TCP 的全部信息（Connection refused / UnknownHost /
      * connect timeout），单独的 TCP 段是每次冷启动白付的一个往返。
-     * 原 TCP 预算（tcpMs）现在用作连接超时，httpMs 用作读超时，总上限不变。
+     *
+     * <p>超时预算：连接阶段给 {@code tcpMs}（https 再加 {@code httpMs}，因为这一阶段
+     * 还包含 TLS 握手），读阶段给 {@code httpMs}。总上限与旧版「TCP 段 + HTTP 段」之和一致，
+     * 所以最坏情况没有变慢。
      *
      * <p>失败原因与旧版一一对应（sync_status.txt 语义不变）：
      * <pre>
@@ -62,6 +86,9 @@ public final class Probe {
      *   read 超时                 → ok(http-slow)     （端口活着只是慢，别修复）
      *   TLS 异常                  → tls-fail:*        （触发修复拉取）
      * </pre>
+     *
+     * <p>注意 "ok" 的含义是<b>配置没坏</b>，不等于<b>这台能用</b>。要选一台服务器接管
+     * 请求请用 {@link #healthy}，它对 5xx / http-slow 是拒绝的。
      */
     public static String checkServer(JSONObject srv, int tcpMs, int httpMs) {
         String token = srv.optString("accessToken", "");
@@ -89,7 +116,13 @@ public final class Probe {
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL(base + "/Users/Me").openConnection();
-            conn.setConnectTimeout(Math.max(tcpMs, 300));
+            // https 时 HttpURLConnection 的 "connect" 阶段还包含 TLS 握手（1~2 个 RTT），
+            // 只给 tcpMs(1200) 会把"建连快、握手慢"的服务器误判成不可达 → 白白触发修复拉取。
+            // 所以连接预算取 tcpMs + httpMs，读预算仍只给 httpMs，总上限与旧版两段之和一致。
+            int connectBudget = "https".equals(protocol)
+                    ? Math.max(tcpMs + httpMs, 600)
+                    : Math.max(tcpMs, 300);
+            conn.setConnectTimeout(connectBudget);
             conn.setReadTimeout(Math.max(httpMs, 300));
             conn.setRequestProperty("X-Emby-Token", token);
             conn.setRequestProperty("Accept", "application/json");
@@ -108,9 +141,11 @@ public final class Probe {
             // 域名没了：服务器到期 / 换地址
             return "tcp-fail:UnknownHost";
         } catch (SocketTimeoutException e) {
-            // 区分连接超时（不可达，修复）与读超时（活着只是慢，别修复）
+            // 区分连接超时（不可达，修复）与读超时（活着只是慢，别修复）。
+            // 注意异常消息是平台实现细节，宁可漏判成"慢"也不要误判成"不可达"：
+            // 误判不可达会触发一次没必要的修复拉取，代价远大于晚一次切换。
             String msg = String.valueOf(e.getMessage()).toLowerCase(java.util.Locale.US);
-            if (msg.contains("connect")) {
+            if (msg.contains("connect") && !msg.contains("read")) {
                 return "tcp-fail:timeout";
             }
             return "ok(http-slow)";
@@ -165,7 +200,9 @@ public final class Probe {
 
             // 并行探测：守护线程各自 checkServer，结果写进 results[i]
             final JSONObject[] objs = candidates.toArray(new JSONObject[0]);
-            final String[] results = new String[n];
+            // volatile 元素：工作线程写完立刻对轮询线程可见（普通数组不保证 happens-before）
+            final java.util.concurrent.atomic.AtomicReferenceArray<String> results =
+                    new java.util.concurrent.atomic.AtomicReferenceArray<String>(n);
             final String[] labels = new String[n];
             for (int i = 0; i < n; i++) {
                 labels[i] = objs[i].optString("alias", objs[i].optString("host",
@@ -176,7 +213,7 @@ public final class Probe {
                 Thread t = new Thread(new Runnable() {
                     @Override
                     public void run() {
-                        results[idx] = checkServer(objs[idx], tcpMs, httpMs);
+                        results.set(idx, checkServer(objs[idx], tcpMs, httpMs));
                     }
                 }, "chai-failover-" + i);
                 t.setDaemon(true);
@@ -190,16 +227,17 @@ public final class Probe {
             String winner = null;
             while (pending > 0 && winner == null) {
                 for (int i = 0; i < n && winner == null; i++) {
-                    if (decided[i] || results[i] == null) {
+                    String r = results.get(i);
+                    if (decided[i] || r == null) {
                         continue;
                     }
                     decided[i] = true;
                     pending--;
-                    if (results[i].startsWith("ok")) {
+                    if (healthy(r)) {
                         winner = objs[i].optString("id", "");
-                        Probe.journal(ctx, "failover -> " + labels[i] + " (" + results[i] + ")");
+                        Probe.journal(ctx, "failover -> " + labels[i] + " (" + r + ")");
                     } else {
-                        Probe.journal(ctx, "failover try " + labels[i] + " -> " + results[i]);
+                        Probe.journal(ctx, "failover try " + labels[i] + " -> " + r);
                     }
                 }
                 if (winner == null && pending > 0) {

@@ -3,21 +3,66 @@
 #
 # 与 build.ps1 等价，区别只是用 bash 直调 java（本机 PowerShell 在沙箱里起不了子进程）。
 #
-# 用法：
+# 用法（推荐：密钥目录，只认一处）：
+#   bash build/build-gh.sh --keys keys-prod "<RAW_URL>"
+#
+#   密钥目录里必须有 pubkey.hex 与 master.b64。默认读 keys-prod/（线上发布用的那套），
+#   想用别的就 --keys keys2。--keys 与位置参数可以混用，显式给了就覆盖目录里的值。
+#
+# 用法（老式，三个位置参数）：
 #   bash build/build-gh.sh <MASTER_B64> <PUBKEY_HEX> <RAW_URL>
+#
+#   ⚠ 2026-10-21 的 1.3 就是因为这里传了 keys/ 的参数、而线上信封是 keys-prod/ 签的，
+#     打出一个永远 bad-signature 的包。现在签名后会自动跑 tools/check-keys.mjs 自检，
+#     对不上直接失败——别再用眼睛核对公钥。
+#
 # 可选环境变量：
 #   APK=/path/to/original.apk   MIRRORS="a,b,c"   OUT=dist/xxx.apk
+#   KEYDIR=keys-prod   密钥目录（等价于 --keys）
 #   PKG=com.xemby.tv   改包名，做出能和原版柴柴并存的一份（改完必须重签名）
 #   FORCE_DECODE=1     强制重新 apktool d（默认按源包 sha 复用 build/decoded）
 #   FORCE_BUILD=1      强制重新 apktool b（默认按清单/资源指纹复用 build/cache/patched.apk）
+#   SKIP_KEY_CHECK=1   跳过构建后的密钥自检（仅限离线排障，发版别用）
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && { pwd -W 2>/dev/null || pwd; })"
 ROOT="$(dirname "$HERE")"
 
-MASTER_B64="${1:?需要 MASTER_B64}"
-PUB_HEX="${2:?需要 PUBKEY_HEX}"
-RAW_URL="${3:?需要 RAW_URL}"
+# ---- 参数：--keys 与三个位置参数都能用，位置参数优先 ----
+KEYDIR="${KEYDIR:-keys-prod}"
+POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --keys)   KEYDIR="${2:?--keys 后面要跟目录}"; shift 2 ;;
+    --keys=*) KEYDIR="${1#--keys=}"; shift ;;
+    -h|--help)
+      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *)        POS+=("$1"); shift ;;
+  esac
+done
+
+# 密钥来源：位置参数 > 密钥目录 > 报错
+if [ "${#POS[@]}" -ge 2 ]; then
+  MASTER_B64="${POS[0]}"
+  PUB_HEX="${POS[1]}"
+  RAW_URL="${POS[2]:-}"
+  KEY_SRC="位置参数"
+else
+  RAW_URL="${POS[0]:-}"
+  KD="$KEYDIR"
+  case "$KD" in /*|[A-Za-z]:*) ;; *) KD="$ROOT/$KD" ;; esac
+  [ -f "$KD/pubkey.hex" ] && [ -f "$KD/master.b64" ] \
+    || { echo "密钥目录缺文件：$KD 需要 pubkey.hex + master.b64（或直接传三个位置参数）" >&2; exit 1; }
+  MASTER_B64="$(tr -d '\r\n' < "$KD/master.b64")"
+  PUB_HEX="$(tr -d '\r\n' < "$KD/pubkey.hex")"
+  KEY_SRC="$KD"
+fi
+
+RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/Qitime/chaisync-config/main/dist/config.enc.json}"
+
+[ -n "$MASTER_B64" ] || { echo "MASTER_B64 为空" >&2; exit 1; }
+[ -n "$PUB_HEX" ]    || { echo "PUBKEY_HEX 为空" >&2; exit 1; }
 
 PKG="${PKG:-com.dh.myembyapp}"
 
@@ -33,6 +78,10 @@ OUT="${OUT:-$ROOT/dist/Xemby-tv-1.2.apk}"
 [ -f "$APK" ]      || { echo "找不到原包：$APK" >&2; exit 1; }
 [ -f "$APKTOOL" ]  || { echo "找不到 apktool：$APKTOOL" >&2; exit 1; }
 [ -f "$BT/lib/d8.jar" ] || { echo "找不到 d8.jar" >&2; exit 1; }
+
+echo "      密钥来源 $KEY_SRC"
+echo "      pubKey   ${PUB_HEX:0:24}…${PUB_HEX: -8}"
+echo "      master   ${MASTER_B64:0:8}…"
 
 WORK="$HERE/work-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$WORK/classes" "$WORK/dexout" "$ROOT/dist"
@@ -210,6 +259,39 @@ fi
 java -jar "$BT/lib/apksigner.jar" sign --ks "$KS" --ks-key-alias xemby \
   --ks-pass pass:xemby2026 --key-pass pass:xemby2026 \
   --out "$OUT" "$WORK/final-aligned.apk"
+
+# ---- 构建后自检：APK 里的公钥/master 必须能解开线上信封 ----
+# 这一步就是防 1.3 那种事故的：编译、签名、安装全都正常，但装到电视上永远 bad-signature。
+if [ -z "${SKIP_KEY_CHECK:-}" ] && command -v node >/dev/null 2>&1; then
+  echo "[自检] 用 APK 内的密钥解一次线上信封"
+  # 允许用本地信封副本（离线/网络受限时）：ENV_FILE=dist/config.enc.json
+  CHECK_ARGS=(--apk "$OUT")
+  [ -n "${ENV_FILE:-}" ] && CHECK_ARGS+=(--env "$ENV_FILE")
+  set +e
+  node "$ROOT/tools/check-keys.mjs" "${CHECK_ARGS[@]}"
+  CHECK_RC=$?
+  set -e
+  if [ "$CHECK_RC" -eq 1 ]; then
+    echo >&2
+    echo "✗ 自检失败：这个包的密钥与线上信封对不上，装到电视上会静默不同步。" >&2
+    echo "  产物留在 $OUT 仅供排查，不要发布。" >&2
+    echo "  确认密钥目录：当前用的是 $KEY_SRC" >&2
+    echo "  确实要跳过自检：SKIP_KEY_CHECK=1（离线排障用，发版别用）" >&2
+    exit 1
+  elif [ "$CHECK_RC" -eq 2 ]; then
+    echo >&2
+    echo "! 自检没能完成（拿不到信封，多半是网络），这不代表密钥错了。" >&2
+    echo "  联网后单独补跑：node tools/check-keys.mjs --apk $OUT" >&2
+    echo "  或指定本地信封：ENV_FILE=dist/config.enc.json bash build/build-gh.sh --keys keys-prod" >&2
+    echo "  包已生成，但发布前必须补一次自检。" >&2
+  elif [ "$CHECK_RC" -ne 0 ]; then
+    echo "✗ 自检异常退出（$CHECK_RC）" >&2
+    exit 1
+  fi
+else
+  [ -n "${SKIP_KEY_CHECK:-}" ] && echo "[自检] 已按 SKIP_KEY_CHECK 跳过"
+  command -v node >/dev/null 2>&1 || echo "[自检] 没有 node，跳过密钥自检（建议装 node 后重跑）"
+fi
 
 echo
 echo "OK -> $OUT"

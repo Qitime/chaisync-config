@@ -1,10 +1,14 @@
 param(
-    [Parameter(Mandatory = $true)][string]$MasterB64,
-    [Parameter(Mandatory = $true)][string]$PubKeyHex,
-    [Parameter(Mandatory = $true)][string]$RawBase,
+    # 推荐只给 -KeyDir，公钥与 master 从目录里读，避免两处手抄对不上。
+    # 传了 -MasterB64/-PubKeyHex 就覆盖目录里的值（老用法仍然可用）。
+    [string]$KeyDir    = "keys-prod",
+    [string]$MasterB64 = "",
+    [string]$PubKeyHex = "",
+    [string]$RawBase   = "https://raw.githubusercontent.com/Qitime/chaisync-config/main/dist/config.enc.json",
     [string]$Mirrors   = "https://ghfast.top/,https://gh-proxy.com/,https://ghproxy.net/",
     [string]$Apk       = "C:\Users\qiqi\Downloads\ChaiChaiEmbyTV-0.3.1-alpha3-arm64-v8a.apk",
-    [switch]$SkipInstall
+    [switch]$SkipInstall,
+    [switch]$SkipKeyCheck
 )
 
 # Repack ChaiChai Emby TV with the GitHub-mirror sync provider.
@@ -14,7 +18,12 @@ param(
 #     everything else is copied byte-for-byte (the .so files stay uncompressed and page aligned)
 #   - the two secrets arrive as parameters and never touch the source tree
 #
+# 密钥来源只有一个：-KeyDir（默认 keys-prod/，即线上发布用的那套）。
+# 2026-10-21 的 1.3 事故就是因为手工传了 keys/ 的参数，打出一个永远 bad-signature 的包。
+# 现在签名后会自动跑 tools/check-keys.mjs，对不上直接失败。
+#
 # Usage:
+#   powershell -ExecutionPolicy Bypass -File .\build\build.ps1 -KeyDir keys-prod
 #   powershell -ExecutionPolicy Bypass -File .\build\build.ps1 `
 #     -MasterB64 "<base64>" -PubKeyHex "<hex>" `
 #     -RawBase "https://raw.githubusercontent.com/you/repo/main/dist/config.enc.json"
@@ -36,6 +45,23 @@ $brandBanner = Join-Path $work 'branding\xemby_banner_1280.png'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $work 'classes') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $work 'dexout') | Out-Null
+
+# 密钥来源：显式参数优先，否则从 -KeyDir 读。缺什么就明确报错，别静默用空串。
+$kd = $KeyDir
+if (-not [System.IO.Path]::IsPathRooted($kd)) { $kd = Join-Path $root $kd }
+if ([string]::IsNullOrWhiteSpace($MasterB64) -or [string]::IsNullOrWhiteSpace($PubKeyHex)) {
+    $pubFile = Join-Path $kd 'pubkey.hex'
+    $mstFile = Join-Path $kd 'master.b64'
+    if (-not (Test-Path $pubFile) -or -not (Test-Path $mstFile)) {
+        throw "密钥目录缺文件：$kd 需要 pubkey.hex + master.b64（或用 -MasterB64/-PubKeyHex 显式传）"
+    }
+    $PubKeyHex = (Get-Content $pubFile -Raw).Trim()
+    $MasterB64 = (Get-Content $mstFile -Raw).Trim()
+    Write-Host "      密钥来源 $kd"
+}
+if ([string]::IsNullOrWhiteSpace($MasterB64)) { throw 'MasterB64 为空' }
+if ([string]::IsNullOrWhiteSpace($PubKeyHex)) { throw 'PubKeyHex 为空' }
+Write-Host ("      pubKey   {0}...{1}" -f $PubKeyHex.Substring(0, 24), $PubKeyHex.Substring($PubKeyHex.Length - 8))
 
 Write-Host "[1/7] writing assets/sync_config.json"
 $cfg = [ordered]@{
@@ -117,6 +143,21 @@ $outApk = Join-Path $work 'Xemby-tv.apk'
     --ks-pass pass:xemby2026 --key-pass pass:xemby2026 `
     --out $outApk (Join-Path $work 'final-aligned.apk')
 if ($LASTEXITCODE -ne 0) { throw 'apksigner failed' }
+
+# 构建后自检：APK 里的公钥/master 必须能解开线上信封。
+# 这一步防的是 1.3 那种事故：编译签名安装全都正常，装到电视上却永远 bad-signature。
+if (-not $SkipKeyCheck) {
+    Write-Host "[自检] 用 APK 内的密钥解一次线上信封"
+    & node (Join-Path $root 'tools\check-keys.mjs') --apk $outApk
+    $rc = $LASTEXITCODE
+    if ($rc -eq 1) {
+        throw "自检失败：$outApk 的密钥与线上信封对不上，装到电视上会静默不同步。产物仅供排查，不要发布。"
+    } elseif ($rc -eq 2) {
+        Write-Warning "自检没能完成（拿不到信封，多半是网络），不代表密钥错了。联网后补跑：node tools/check-keys.mjs --apk $outApk"
+    } elseif ($rc -ne 0) {
+        throw "自检异常退出（$rc）"
+    }
+}
 
 Write-Host "[7/7] OK -> $outApk"
 

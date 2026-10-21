@@ -73,26 +73,34 @@ public final class Fetcher {
     /* 异步句柄：镜像竞速用。start 发出不等待，poll 非阻塞收结果          */
     /* ------------------------------------------------------------------ */
 
-    /** 一次已发出、尚未（或已经）完成的抓取。线程安全：holder 是 volatile 语义数组。 */
+    /**
+     * 一次已发出、尚未（或已经）完成的抓取。
+     *
+     * <p>线程安全靠 {@code volatile result}：写线程在跑完 fetchOnce 后一次性发布结果，
+     * 主线程的 poll() 读到的要么是 null（未完成），要么是<b>已经完全构造好</b>的 Result。
+     * 这里不能用一个普通数组当信箱——数组引用本身不保证跨线程可见性，ARM 上可能
+     * 一直读到 null，竞速轮询就会白等到预算耗尽。
+     */
     public static final class Fetch {
-        private final Result[] holder = new Result[1];
+        /** 完成时由 chai-fetch 线程写入；volatile 建立 happens-before，主线程可见 */
+        private volatile Result result;
         private final Thread thread;
         private final long started = System.currentTimeMillis();
-        /** 结果已被上层消费过（避免竞速轮询里重复验签同一个结果） */
+        /** 结果已被上层消费过（避免竞速轮询里重复验签同一个结果）；只在主线程读写 */
         public boolean taken;
 
         private Fetch(final String url, final int timeoutMs) {
             thread = new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    holder[0] = fetchOnce(url, timeoutMs);
+                    result = fetchOnce(url, timeoutMs);
                 }
             }, "chai-fetch");
         }
 
         /** 非阻塞：完成返回结果，未完成返回 null。 */
         public Result poll() {
-            return holder[0];
+            return result;
         }
 
         /** 阻塞等待最多 ms。 */
@@ -107,7 +115,7 @@ public final class Fetcher {
         }
 
         boolean done() {
-            return holder[0] != null || !thread.isAlive();
+            return result != null || !thread.isAlive();
         }
     }
 

@@ -160,22 +160,31 @@ public final class SyncProvider extends ContentProvider {
         int launched = 0;
 
         try {
+            // launching=false 表示预算用完、不再发新镜像，但已发出的请求要继续收完
+            boolean launching = true;
+            // 排空最多再等 1.2s：足够接住"差一点就回来"的结果，又不至于把首屏拖长
+            long drainDeadline = deadline + 1200L;
             while (true) {
                 // 阶梯发出：第 i 个镜像在 round + i*stagger 后仍无成功结果才发出
-                if (launched < n) {
+                if (launching && launched < n) {
                     long due = round + (long) launched * stagger;
                     long now = System.currentTimeMillis();
-                    if (now < due) {
-                        Thread.sleep(due - now);
+                    // 等阶梯间隔时也要盯着截止时间，否则最后一个镜像会把预算睡穿
+                    long sleepFor = Math.min(due - now, deadline - now);
+                    if (sleepFor > 0) {
+                        Thread.sleep(sleepFor);
                     }
                     int remain = (int) (deadline - System.currentTimeMillis());
                     if (remain < 900) {
+                        // 预算用完：停止发新请求，但继续收已发出的——直接 break 会把
+                        // "马上就回来"的结果丢掉，表现成无故 fetch-failed。
+                        launching = false;
                         reasons.append(" |budget-exhausted");
-                        break;
+                    } else {
+                        String url = Fetcher.buildUrl(cfg.mirrors[launched], cfg.rawUrl, buster);
+                        fetches[launched] = Fetcher.start(url, Math.min(cfg.fetchTryMs, remain));
+                        launched++;
                     }
-                    String url = Fetcher.buildUrl(cfg.mirrors[launched], cfg.rawUrl, buster);
-                    fetches[launched] = Fetcher.start(url, Math.min(cfg.fetchTryMs, remain));
-                    launched++;
                 }
 
                 // 收结果：先到先验签；验签被拒不取消其它在飞的请求
@@ -220,8 +229,14 @@ public final class SyncProvider extends ContentProvider {
                     }
                 }
 
-                // 退出条件：所有已发出的都收完且发完了
-                if (!anyPending && launched >= n) {
+                // 退出条件：所有已发出的都收完，且没有新的要发了
+                if (!anyPending && (launched >= n || !launching)) {
+                    break;
+                }
+                // 排空阶段的兜底：在飞请求自己的读超时也有限，这里再加一道总闸，
+                // 避免某个镜像"连上了但一字节一字节挤"把首屏拖死
+                if (!launching && System.currentTimeMillis() > drainDeadline) {
+                    reasons.append(" |drain-timeout");
                     break;
                 }
                 Thread.sleep(60);
