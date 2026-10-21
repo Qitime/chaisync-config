@@ -92,6 +92,7 @@ cfg = {
     "probeHttpMs": 1500,
     "fetchBudgetMs": 9000,
     "fetchTryMs": 3200,
+    "fetchStaggerMs": 900,
 }
 os.makedirs(os.path.dirname(out), exist_ok=True)
 json.dump(cfg, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)

@@ -11,8 +11,6 @@ import java.io.File;
 import java.io.FileOutputStream;
 
 import java.net.HttpURLConnection;
-import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -47,7 +45,24 @@ public final class Probe {
         return checkServer(srv, tcpMs, httpMs);
     }
 
-    /** 对指定服务器做同样的 TCP + /Users/Me 判断。 */
+    /**
+     * 对指定服务器做健康判断。
+     *
+     * <p>只有一次 HTTP 请求（GET /Users/Me），不再先发一个裸 TCP 探测：
+     * HTTP 的连接阶段本身就携带 TCP 的全部信息（Connection refused / UnknownHost /
+     * connect timeout），单独的 TCP 段是每次冷启动白付的一个往返。
+     * 原 TCP 预算（tcpMs）现在用作连接超时，httpMs 用作读超时，总上限不变。
+     *
+     * <p>失败原因与旧版一一对应（sync_status.txt 语义不变）：
+     * <pre>
+     *   200                       → ok
+     *   401/403                   → token-invalid:N   （跑 refresh 重新发布）
+     *   其他 4xx/5xx              → ok(http N)        （HTTP 活着，不算坏配置）
+     *   Connection refused / 未知主机 / connect 超时 → tcp-fail:*  （触发修复拉取）
+     *   read 超时                 → ok(http-slow)     （端口活着只是慢，别修复）
+     *   TLS 异常                  → tls-fail:*        （触发修复拉取）
+     * </pre>
+     */
     public static String checkServer(JSONObject srv, int tcpMs, int httpMs) {
         String token = srv.optString("accessToken", "");
         String userId = srv.optString("userId", "");
@@ -69,29 +84,13 @@ public final class Probe {
             return "empty-host";
         }
 
-        Socket socket = new Socket();
-        try {
-            socket.connect(new InetSocketAddress(host, port), tcpMs);
-        } catch (Throwable t) {
-            return "tcp-fail:" + t.getClass().getSimpleName();
-        } finally {
-            try {
-                socket.close();
-            } catch (Throwable ignored) {
-            }
-        }
-
-        if (httpMs <= 0) {
-            return "ok(tcp-only)";
-        }
-
         String base = protocol + "://" + host + ":" + port
                 + (path.isEmpty() ? "" : "/" + path);
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL(base + "/Users/Me").openConnection();
-            conn.setConnectTimeout(httpMs);
-            conn.setReadTimeout(httpMs);
+            conn.setConnectTimeout(Math.max(tcpMs, 300));
+            conn.setReadTimeout(Math.max(httpMs, 300));
             conn.setRequestProperty("X-Emby-Token", token);
             conn.setRequestProperty("Accept", "application/json");
             int code = conn.getResponseCode();
@@ -102,8 +101,18 @@ public final class Probe {
                 return "token-invalid:" + code;
             }
             return "ok(http " + code + ")";
+        } catch (java.net.ConnectException e) {
+            // 端口拒绝：服务器没活 / 端口被封
+            return "tcp-fail:ConnectException";
+        } catch (java.net.UnknownHostException e) {
+            // 域名没了：服务器到期 / 换地址
+            return "tcp-fail:UnknownHost";
         } catch (SocketTimeoutException e) {
-            // 端口活着，只是慢；不算坏配置，重拉一次反而更糟
+            // 区分连接超时（不可达，修复）与读超时（活着只是慢，别修复）
+            String msg = String.valueOf(e.getMessage()).toLowerCase(java.util.Locale.US);
+            if (msg.contains("connect")) {
+                return "tcp-fail:timeout";
+            }
             return "ok(http-slow)";
         } catch (SSLException e) {
             return "tls-fail:" + e.getClass().getSimpleName();
@@ -120,11 +129,15 @@ public final class Probe {
     }
 
     /**
-     * 当前服务器不可用时，按配置顺序尝试后续服务器。
+     * 当前服务器不可用时，在其余服务器中找一台能用的。
      *
-     * <p>只在启动阶段调用，而且有总预算：每台服务器最多 tcpMs + httpMs，
-     * 全部失败也不会把开机拖太久。成功即写 last_used_server，
-     * 之后 MainActivity.onCreate 会直接读到新服务器。
+     * <p>所有候选<b>并行</b>探测（每台独立拿全额 tcpMs + httpMs），按 server_order
+     * 优先级轮询收结果、第一个健康的即选中。旧版逐台串行时最坏把 3.5s 预算花在
+     * 前面的死服务器上；并行后总耗时 ≈ 最快那台健康服务器的响应时间，
+     * 全部失败也就 2.7s 左右（单台探测上限），不会拖满预算。
+     *
+     * <p>只在启动阶段调用。成功即写 last_used_server，之后 MainActivity.onCreate
+     * 会直接读到新服务器。
      *
      * @return 切换到的服务器 id；没有可用服务器时返回 null
      */
@@ -136,43 +149,76 @@ public final class Probe {
                 return null;
             }
             String currentId = sp.getString("last_used_server", "");
-            int start = -1;
+
+            // 候选 = 排除当前服务器，保持 server_order 优先级
+            java.util.List<JSONObject> candidates = new java.util.ArrayList<JSONObject>();
             for (int i = 0; i < servers.length(); i++) {
                 JSONObject o = servers.optJSONObject(i);
-                if (o != null && currentId.equals(o.optString("id", ""))) {
-                    start = i;
-                    break;
+                if (o != null && !currentId.equals(o.optString("id", ""))) {
+                    candidates.add(o);
+                }
+            }
+            int n = candidates.size();
+            if (n == 0) {
+                return null;
+            }
+
+            // 并行探测：守护线程各自 checkServer，结果写进 results[i]
+            final JSONObject[] objs = candidates.toArray(new JSONObject[0]);
+            final String[] results = new String[n];
+            final String[] labels = new String[n];
+            for (int i = 0; i < n; i++) {
+                labels[i] = objs[i].optString("alias", objs[i].optString("host",
+                        objs[i].optString("id", "")));
+            }
+            for (int i = 0; i < n; i++) {
+                final int idx = i;
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        results[idx] = checkServer(objs[idx], tcpMs, httpMs);
+                    }
+                }, "chai-failover-" + i);
+                t.setDaemon(true);
+                t.start();
+            }
+
+            // 按优先级轮询：同一窗口内多个完成时取 order 最靠前的健康者
+            long deadline = System.currentTimeMillis() + Math.max(budgetMs, 1000L);
+            boolean[] decided = new boolean[n];
+            int pending = n;
+            String winner = null;
+            while (pending > 0 && winner == null) {
+                for (int i = 0; i < n && winner == null; i++) {
+                    if (decided[i] || results[i] == null) {
+                        continue;
+                    }
+                    decided[i] = true;
+                    pending--;
+                    if (results[i].startsWith("ok")) {
+                        winner = objs[i].optString("id", "");
+                        Probe.journal(ctx, "failover -> " + labels[i] + " (" + results[i] + ")");
+                    } else {
+                        Probe.journal(ctx, "failover try " + labels[i] + " -> " + results[i]);
+                    }
+                }
+                if (winner == null && pending > 0) {
+                    if (System.currentTimeMillis() >= deadline) {
+                        Probe.journal(ctx, "failover budget-exhausted");
+                        break;
+                    }
+                    Thread.sleep(80);
                 }
             }
 
-            long deadline = System.currentTimeMillis() + Math.max(budgetMs, 1000L);
-            for (int step = 0; step < servers.length(); step++) {
-                int idx = start < 0 ? step : (start + step) % servers.length();
-                if (idx == start) {
-                    continue;
-                }
-                int remain = (int) (deadline - System.currentTimeMillis());
-                if (remain < 350) {
-                    Probe.journal(ctx, "failover budget-exhausted");
-                    break;
-                }
-                JSONObject s = servers.optJSONObject(idx);
-                if (s == null) {
-                    continue;
-                }
-                String id = s.optString("id", "");
-                String label = s.optString("alias", s.optString("host", id));
-                String r = checkServer(s,
-                        Math.max(250, Math.min(tcpMs, remain / 2)),
-                        Math.max(300, Math.min(httpMs, remain - 250)));
-                if (r.startsWith("ok")) {
-                    sp.edit().putString("last_used_server", id).commit();
-                    Probe.journal(ctx, "failover -> " + label + " (" + r + ")");
-                    return id;
-                }
-                Probe.journal(ctx, "failover try " + label + " -> " + r);
+            if (winner != null) {
+                sp.edit().putString("last_used_server", winner).commit();
+                return winner;
             }
             Probe.journal(ctx, "failover none available");
+            return null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             return null;
         } catch (Throwable t) {
             Probe.journal(ctx, "failover crashed: " + t.getClass().getSimpleName());

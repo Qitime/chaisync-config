@@ -62,6 +62,8 @@ public final class Store {
         public int probeHttpMs = 1500;
         public int fetchBudgetMs = 9000;
         public int fetchTryMs = 3200;
+        /** 镜像竞速的阶梯间隔：0 以下用 SyncProvider 默认值 */
+        public int fetchStaggerMs = 900;
     }
 
     public static AppConfig loadConfig(Context ctx) {
@@ -85,6 +87,7 @@ public final class Store {
             c.probeHttpMs = o.optInt("probeHttpMs", 1500);
             c.fetchBudgetMs = o.optInt("fetchBudgetMs", 9000);
             c.fetchTryMs = o.optInt("fetchTryMs", 3200);
+            c.fetchStaggerMs = o.optInt("fetchStaggerMs", 900);
 
             JSONArray arr = o.optJSONArray("mirrors");
             if (arr != null) {

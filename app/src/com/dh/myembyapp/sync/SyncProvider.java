@@ -32,6 +32,9 @@ public final class SyncProvider extends ContentProvider {
 
     private static final String TAG = "ChaiSync";
 
+    /** 镜像竞速的阶梯间隔：首个镜像发出 900ms 仍无结果才发下一个（fetchStaggerMs 可覆盖） */
+    private static final int DEFAULT_STAGGER_MS = 900;
+
     @Override
     public boolean onCreate() {
         final Context ctx = getContext();
@@ -99,6 +102,11 @@ public final class SyncProvider extends ContentProvider {
      * 遍历镜像，逐个验签。任何一层拒绝都只影响这一次尝试，继续换下一个源；
      * 全部失败才保留本地配置。
      *
+     * <p>镜像之间是<b>竞速</b>（hedged fetch）而不是串行：第 1 个立即发出，
+     * 900ms 内没有结果才发第 2 个，再 900ms 发第 3 个；已发出的请求不取消，
+     * 谁先带回完整信封且验签通过就用谁。串行写法在全慢的镜像面前会把 9s 预算
+     * 烧光（3 × 3.2s），竞速后最坏 ~4s，典型情况（首个镜像 <1s）不多打镜像站。
+     *
      * <p>为什么要有第二遍：第一遍的缓存键是 {@code ?v=<lastSeq>}，而 raw 有
      * {@code Cache-Control: max-age=300}（实测），所以刚发布完的 5 分钟内，
      * 这个 URL 仍会返回上一个版本 → 验签通过但 seq 不前进 → 被判 rollback。
@@ -125,45 +133,111 @@ public final class SyncProvider extends ContentProvider {
                 break;
             }
             String buster = pass == 0 ? String.valueOf(lastSeq) : "t" + System.currentTimeMillis();
-            for (String mirror : cfg.mirrors) {
-                int remain = (int) (deadline - System.currentTimeMillis());
-                if (remain < 900) {
-                    reasons.append(" |budget-exhausted");
-                    break;
-                }
-                String url = Fetcher.buildUrl(mirror, cfg.rawUrl, buster);
-                Fetcher.Result r = Fetcher.get(url, Math.min(cfg.fetchTryMs, remain));
-                String via = hostOf(mirror);
-
-                if (!r.usable()) {
-                    reasons.append('|').append(via).append(':').append(r.status)
-                            .append(r.detail.isEmpty() ? "" : r.detail);
-                    Probe.journal(ctx, "get " + via + " -> " + r.status + " " + r.detail
-                            + " (" + r.ms + "ms)");
-                    continue;
-                }
-
-                try {
-                    Envelope.Opened opened = env.open(r.body, lastSeq);
-                    Store.saveCached(sync, opened.payload, opened.seq);
-                    boolean applied = Store.apply(ctx, sync, opened.payload, opened.seq);
-                    Probe.journal(ctx, "verified via=" + via + " seq=" + opened.seq
-                            + " kid=" + opened.kid + " applied=" + applied + " (" + r.ms + "ms)");
-                    return;
-                } catch (Envelope.Reject rej) {
-                    if ("rollback".equals(rej.code)) {
-                        sawRollback = true;
-                    }
-                    reasons.append('|').append(via).append(':').append(rej.code);
-                    Probe.journal(ctx, "reject " + rej.code + " from " + via + " :: " + rej.getMessage());
-                } catch (Throwable t) {
-                    reasons.append('|').append(via).append(":err");
-                    Probe.journal(ctx, "verify crashed: " + t);
-                }
+            boolean[] rb = new boolean[1];
+            if (hedgedFetch(ctx, env, cfg, buster, lastSeq, deadline, sync, reasons, rb)) {
+                return;
             }
+            sawRollback |= rb[0];
         }
 
         Probe.journal(ctx, "fetch-failed" + reasons + " | keep local");
+    }
+
+    /**
+     * 一轮竞速拉取 + 验签 + 应用。
+     *
+     * @param sawRollbackOut 出参：本轮是否见过 rollback（seq 未前进），供外层决定换缓存键重问
+     * @return 任一镜像验签通过并完成应用返回 true；预算耗尽/全部被拒返回 false
+     */
+    private static boolean hedgedFetch(Context ctx, Envelope env, Store.AppConfig cfg,
+                                       String buster, long lastSeq, long deadline,
+                                       SharedPreferences sync, StringBuilder reasons,
+                                       boolean[] sawRollbackOut) {
+        int n = cfg.mirrors.length;
+        Fetcher.Fetch[] fetches = new Fetcher.Fetch[n];
+        int stagger = cfg.fetchStaggerMs > 0 ? cfg.fetchStaggerMs : DEFAULT_STAGGER_MS;
+        long round = System.currentTimeMillis();
+        int launched = 0;
+
+        try {
+            while (true) {
+                // 阶梯发出：第 i 个镜像在 round + i*stagger 后仍无成功结果才发出
+                if (launched < n) {
+                    long due = round + (long) launched * stagger;
+                    long now = System.currentTimeMillis();
+                    if (now < due) {
+                        Thread.sleep(due - now);
+                    }
+                    int remain = (int) (deadline - System.currentTimeMillis());
+                    if (remain < 900) {
+                        reasons.append(" |budget-exhausted");
+                        break;
+                    }
+                    String url = Fetcher.buildUrl(cfg.mirrors[launched], cfg.rawUrl, buster);
+                    fetches[launched] = Fetcher.start(url, Math.min(cfg.fetchTryMs, remain));
+                    launched++;
+                }
+
+                // 收结果：先到先验签；验签被拒不取消其它在飞的请求
+                boolean anyPending = false;
+                for (int i = 0; i < launched; i++) {
+                    Fetcher.Fetch f = fetches[i];
+                    if (f == null || f.taken) {
+                        continue;
+                    }
+                    Fetcher.Result r = f.poll();
+                    if (r == null) {
+                        anyPending = true;
+                        continue;
+                    }
+                    f.taken = true;
+                    String via = hostOf(cfg.mirrors[i]);
+                    if (!r.usable()) {
+                        reasons.append('|').append(via).append(':').append(r.status)
+                                .append(r.detail.isEmpty() ? "" : r.detail);
+                        Probe.journal(ctx, "get " + via + " -> " + r.status + " " + r.detail
+                                + " (" + r.ms + "ms)");
+                        continue;
+                    }
+                    try {
+                        Envelope.Opened opened = env.open(r.body, lastSeq);
+                        Store.saveCached(sync, opened.payload, opened.seq);
+                        boolean applied = Store.apply(ctx, sync, opened.payload, opened.seq);
+                        Probe.journal(ctx, "verified via=" + via + " seq=" + opened.seq
+                                + " kid=" + opened.kid + " applied=" + applied
+                                + " (" + r.ms + "ms, " + launched + " raced)");
+                        return true;
+                    } catch (Envelope.Reject rej) {
+                        if ("rollback".equals(rej.code)) {
+                            sawRollbackOut[0] = true; // 供外层 pass 循环判断是否换缓存键重问
+                        }
+                        reasons.append('|').append(via).append(':').append(rej.code);
+                        Probe.journal(ctx, "reject " + rej.code + " from " + via
+                                + " :: " + rej.getMessage());
+                    } catch (Throwable t) {
+                        reasons.append('|').append(via).append(":err");
+                        Probe.journal(ctx, "verify crashed: " + t);
+                    }
+                }
+
+                // 退出条件：所有已发出的都收完且发完了
+                if (!anyPending && launched >= n) {
+                    break;
+                }
+                Thread.sleep(60);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            // 未完成的抓取让它们自然收尾（守护线程），避免句柄悬挂
+            for (int i = 0; i < launched; i++) {
+                Fetcher.Fetch f = fetches[i];
+                if (f != null && !f.taken) {
+                    f.join(250);
+                }
+            }
+        }
+        return false;
     }
 
     /**

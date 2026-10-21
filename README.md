@@ -270,6 +270,15 @@ bash admin/run-tests.sh     # 协议回归测试，不需要设备
 探测优先是省流量的关键：**服务器好好的时候完全不碰 GitHub**。
 所以你日常开机不会因为镜像抖动而不稳，只有真出问题时才走网络。
 
+探测本身只有**一次 HTTP 请求**（`GET /Users/Me`）：连接阶段超时视为服务器不可达
+（触发修复），读超时视为「活着只是慢」（不修复）。旧版先裸 TCP 再 HTTP 的两段式
+已去掉——HTTP 的连接异常本来就携带 TCP 的全部信息，单发一次省一个往返。
+
+拉取时镜像之间是**竞速**（hedged fetch）：第 1 个镜像立即发出，900ms 内没有结果
+才发第 2 个，再 900ms 发第 3 个；已发出的请求不取消，谁先带回完整信封且验签通过
+就用谁。全慢的最坏情况从 9s（串行烧光预算）压到 ~4s。启动故障转移的探测也改成了
+**并行筛活**：所有候选服务器同时探测，第一个健康的直接用，3.5s 预算内基本都能出结果。
+
 拉取时按 `mirrors` 顺序逐个试，每个响应都过一遍 `Envelope.open()`：
 验签失败或被判 rollback 就换下一个源，全挂才保留本地。
 
@@ -338,7 +347,7 @@ adb shell cat /sdcard/Android/data/com.dh.myembyapp/files/sync_status.txt
 | 码 | 含义 | 处理 |
 |---|---|---|
 | `probe ok (...) -> fast path` | 正常，没碰网络 | — |
-| `probe failed (tcp-fail...)` | 服务器换了/挂了/端口被封 | 正常流程，会去拉新配置 |
+| `probe failed (tcp-fail...)` | 服务器换了/挂了/端口被封（ConnectException / UnknownHost / connect 超时） | 正常流程，会去拉新配置 |
 | `probe failed (token-invalid:401)` | token 失效 | 跑 `refresh` 重新发布 |
 | `verified via=... seq=N` | 成功 | — |
 | `bad-signature` | 签名不对：镜像篡改，或 APK 里的公钥与发布端不匹配 | 核对 `-PubKeyHex` 与 `keys/pubkey.hex` |

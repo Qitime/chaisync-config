@@ -60,59 +60,98 @@ public final class Fetcher {
     }
 
     public static Result get(final String url, final int timeoutMs) {
-        final Result[] holder = new Result[1];
-        final long started = System.currentTimeMillis();
+        Fetch f = start(url, timeoutMs);
+        f.join(timeoutMs + 200L);
+        Result r = f.poll();
+        if (r != null) {
+            return r;
+        }
+        return new Result(0, null, "timeout>" + timeoutMs + "ms", System.currentTimeMillis() - f.started);
+    }
 
-        Thread t = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                HttpURLConnection conn = null;
+    /* ------------------------------------------------------------------ */
+    /* 异步句柄：镜像竞速用。start 发出不等待，poll 非阻塞收结果          */
+    /* ------------------------------------------------------------------ */
+
+    /** 一次已发出、尚未（或已经）完成的抓取。线程安全：holder 是 volatile 语义数组。 */
+    public static final class Fetch {
+        private final Result[] holder = new Result[1];
+        private final Thread thread;
+        private final long started = System.currentTimeMillis();
+        /** 结果已被上层消费过（避免竞速轮询里重复验签同一个结果） */
+        public boolean taken;
+
+        private Fetch(final String url, final int timeoutMs) {
+            thread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    holder[0] = fetchOnce(url, timeoutMs);
+                }
+            }, "chai-fetch");
+        }
+
+        /** 非阻塞：完成返回结果，未完成返回 null。 */
+        public Result poll() {
+            return holder[0];
+        }
+
+        /** 阻塞等待最多 ms。 */
+        public void join(long ms) {
+            if (ms > 0) {
                 try {
-                    conn = (HttpURLConnection) new URL(url).openConnection();
-                    conn.setConnectTimeout(timeoutMs);
-                    conn.setReadTimeout(timeoutMs);
-                    conn.setRequestProperty("User-Agent", UA);
-                    conn.setRequestProperty("Accept", "application/json, text/plain, */*");
-                    // 不要跟随到不可预期的跨主机跳转；镜像站正常情况下是 200 直出
-                    conn.setInstanceFollowRedirects(true);
-
-                    int code = conn.getResponseCode();
-                    if (code != 200) {
-                        String err = readSmall(conn.getErrorStream());
-                        holder[0] = new Result(code, null,
-                                "http " + code + (err.isEmpty() ? "" : (" " + err)),
-                                System.currentTimeMillis() - started);
-                        return;
-                    }
-                    holder[0] = new Result(200, readAll(conn.getInputStream()), "",
-                            System.currentTimeMillis() - started);
-                } catch (Throwable e) {
-                    holder[0] = new Result(0, null, e.getClass().getSimpleName(),
-                            System.currentTimeMillis() - started);
-                    Log.w(TAG, "fetch " + url + " failed", e);
-                } finally {
-                    if (conn != null) {
-                        try {
-                            conn.disconnect();
-                        } catch (Throwable ignored) {
-                        }
-                    }
+                    thread.join(ms);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
             }
-        }, "chai-fetch");
+        }
 
-        t.setDaemon(true);
-        t.start();
+        boolean done() {
+            return holder[0] != null || !thread.isAlive();
+        }
+    }
+
+    /** 发出一个抓取，立即返回。线程为守护线程，没人 join 也会随进程退出。 */
+    public static Fetch start(final String url, final int timeoutMs) {
+        Fetch f = new Fetch(url, timeoutMs);
+        f.thread.setDaemon(true);
+        f.thread.start();
+        return f;
+    }
+
+    /** 同步抓一次（get/start 的公共实现）。 */
+    private static Result fetchOnce(String url, int timeoutMs) {
+        final long started = System.currentTimeMillis();
+        HttpURLConnection conn = null;
         try {
-            t.join(timeoutMs + 200L);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        if (holder[0] == null) {
-            return new Result(0, null, "timeout>" + timeoutMs + "ms",
+            conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setConnectTimeout(timeoutMs);
+            conn.setReadTimeout(timeoutMs);
+            conn.setRequestProperty("User-Agent", UA);
+            conn.setRequestProperty("Accept", "application/json, text/plain, */*");
+            // 不要跟随到不可预期的跨主机跳转；镜像站正常情况下是 200 直出
+            conn.setInstanceFollowRedirects(true);
+
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                String err = readSmall(conn.getErrorStream());
+                return new Result(code, null,
+                        "http " + code + (err.isEmpty() ? "" : (" " + err)),
+                        System.currentTimeMillis() - started);
+            }
+            return new Result(200, readAll(conn.getInputStream()), "",
                     System.currentTimeMillis() - started);
+        } catch (Throwable e) {
+            return new Result(0, null, e.getClass().getSimpleName(),
+                    System.currentTimeMillis() - started);
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Throwable ignored) {
+                }
+            }
         }
-        return holder[0];
     }
 
     private static String readAll(InputStream in) {
