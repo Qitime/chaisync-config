@@ -63,7 +63,11 @@ public final class Probe {
         if ("ok".equals(result)) {
             return true;
         }
-        return result.startsWith("token-invalid:");
+        if (result.startsWith("token-invalid:")) {
+            return true;
+        }
+        // 无 token 信封（云端只下发账密）：服务器可达但未登录，配合自愈重登可用
+        return "not-logged-in".equals(result);
     }
 
     /**

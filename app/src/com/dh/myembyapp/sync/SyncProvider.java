@@ -154,12 +154,13 @@ public final class SyncProvider extends ContentProvider {
         cloudRepair(ctx, sync, cfg);
     }
 
-    /** 本地重登并确认新 token 已生效 */
+    /**
+     * 本地重登：AuthenticateByName 拿到 200 并写回 token 即视为恢复。
+     * 不再用 /Users/Me 复核——部分 Emby 对该端点即使带有效 token 也返回 500
+     * （如 embymv.cc:8096），复核会导致登录成功仍误判双失败、弹窗。
+     */
     private static boolean healLocal(Context ctx, Store.AppConfig cfg) {
-        if (!SelfHeal.tryRelogin(ctx, cfg.probeTcpMs, cfg.probeHttpMs)) {
-            return false;
-        }
-        return Probe.check(ctx, cfg.probeTcpMs, cfg.probeHttpMs).startsWith("ok");
+        return SelfHeal.tryRelogin(ctx, cfg.probeTcpMs, cfg.probeHttpMs);
     }
 
     /** 拉取云端信封 + 应用 + 本地 failover 筛活 */
