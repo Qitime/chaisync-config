@@ -1,0 +1,106 @@
+name: publish-config
+
+# 2026-11-01 事故复盘后重写：
+#   1) 默认改为【手动触发】，不再 cron 自动发布——无人值守最容易把错密钥/错内容推上去。
+#      如确需自动，请显式加回 schedule，并保证下方 PIN 审计通过。
+#   2) 新增指纹闸门：私钥指纹必须等于 PUBLIC_KEY_PIN，否则任何信封都不会产生。
+#   3) 不再“刷新 token”后发布：按账密直登模型，明文里只放账密字段，
+#      seq 由 CI 根据仓库内已有信封自动 +1（防回滚）。
+#
+# 需要的 Secrets：
+#   CONFIG_JSON     完整明文配置 JSON（就是本地 config/config.json 的内容）
+#   MASTER_B64      主密钥（keys-prod/master.b64 的内容）
+#   SIGNING_KEY     ECDSA 私钥（keys-prod/signing.pem 的内容，含 BEGIN/END 行）
+#   PUBLIC_KEY_PIN  公钥指纹（keys-prod/keyset.json 里的 fingerprint，生产应为
+#                   a2bd28aca42dd2cd93009d50cad98f38）
+#
+# 注意：公开仓库 Actions 日志对所有人可见，严禁 echo 凭据；GitHub 自动打码只认精确匹配。
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: '触发原因（只写进 commit message）'
+        required: false
+        default: 'manual'
+      force_seq:
+        description: '强制 seq（一般留空自动 +1；如线上信封比本地新，请填更大的数字）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-config
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Assemble plaintext config from secret
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          mkdir -p config
+          printf '%s' "$CONFIG_JSON" > config/config.json
+          node -e "const c=JSON.parse(require('fs').readFileSync('config/config.json','utf8')); console.log('servers=' + (c.servers||[]).length);"
+
+      # 闸门 1：私钥指纹必须命中 PIN（防错套密钥）
+      - name: Gate — signing key fingerprint must equal pinned pubkey
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          PUBLIC_KEY_PIN: ${{ secrets.PUBLIC_KEY_PIN }}
+        run: |
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/signing.pem"
+          node - <<'EOF'
+          const fs=require('fs'), c=require('crypto');
+          const pin=(process.env.PUBLIC_KEY_PIN||'').trim().toLowerCase();
+          if(!pin){ console.error('✗ 缺少 PUBLIC_KEY_PIN secret，拒绝发布'); process.exit(1); }
+          const pem=fs.readFileSync(process.env.RUNNER_TEMP+'/signing.pem');
+          const fp=c.createHash('sha256')
+                    .update(c.createPublicKey(pem).export({type:'spki',format:'der'}))
+                    .digest('hex').slice(0,32);
+          console.log('signing key fingerprint = '+fp);
+          if(fp!==pin){ console.error('✗ 私钥指纹 ≠ PIN，拒绝发布'); process.exit(1); }
+          console.log('✓ PIN 审计通过');
+          EOF
+
+      # 闸门 2：publish 内部还会按 config/expected-keyset.json 断言指纹（与上一步双重保险）
+      - name: Publish envelope (ciphertext only, seq auto-increment)
+        env:
+          MASTER_B64: ${{ secrets.MASTER_B64 }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          EXTRA=""
+          if [ -n "${{ github.event.inputs.force_seq }}" ]; then EXTRA="--seq ${{ github.event.inputs.force_seq }}"; fi
+          node tools/publish.mjs publish \
+            --in config/config.json \
+            --out dist/config.enc.json \
+            --key "$RUNNER_TEMP/signing.pem" \
+            --master "$MASTER_B64" \
+            --kid k1 \
+            $EXTRA
+
+      - name: Commit ciphertext only
+        run: |
+          rm -f config/config.json "$RUNNER_TEMP/signing.pem"
+          git config user.name "chaisync-bot"
+          git config user.email "bot@users.noreply.github.com"
+          if git diff --quiet -- dist/; then
+            echo "no change in dist/, nothing to commit"
+            exit 0
+          fi
+          SEQ=$(node -p "require('./dist/config.enc.json').seq")
+          git add dist/config.enc.json
+          git commit -m "config: seq ${SEQ} (${{ github.event.inputs.reason || 'manual' }})"
+          git push

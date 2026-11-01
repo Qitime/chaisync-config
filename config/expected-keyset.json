@@ -1,0 +1,18 @@
+{
+  "说明": "发布/构建/CI 共用的单一权威指纹台账。只含公钥指纹，不含任何私钥/主密钥。新增密钥组请用 tools/genkey --role，并把指纹同步到这里（或运行 tools/register-keyset.mjs）。",
+  "prod": {
+    "role": "prod",
+    "fingerprint": "a2bd28aca42dd2cd93009d50cad98f38",
+    "rawUrl": "https://raw.githubusercontent.com/Qitime/chaisync-config/main/dist/config.enc.json",
+    "mirrors": [
+      "https://ghfast.top/https://raw.githubusercontent.com/Qitime/chaisync-config/main/dist/config.enc.json",
+      "https://gh-proxy.com/https://raw.githubusercontent.com/Qitime/chaisync-config/main/dist/config.enc.json",
+      "https://ghproxy.net/https://raw.githubusercontent.com/Qitime/chaisync-config/main/dist/config.enc.json"
+    ]
+  },
+  "dev": {
+    "role": "dev",
+    "fingerprint": "2c108859de388de366c187fb238bf192",
+    "note": "本地演练组 keys/，绝不可发布到线上"
+  }
+}

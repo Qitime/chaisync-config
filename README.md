@@ -419,6 +419,15 @@ adb shell cat /sdcard/Android/data/com.dh.myembyapp/files/sync_status.txt
 
 ## 环境依赖
 
+**信封发布安全**（防止密钥错套 / seq 回滚 / CI 误发）：
+
+- 完整设计与命令规范见 [`docs/envelope-design.md`](docs/envelope-design.md)。
+- 一句话：发布一律 `tools/publish-safe.sh`（或 `publish --keys-dir keys-prod`），
+  私钥指纹必须等于 `config/expected-keyset.json` 的 `prod.fingerprint`（`a2bd28aca42dd2cd93009d50cad98f38`），
+  不匹配会被直接拒绝。
+- CI（`.github/workflows/publish-manual.yml`）已改为手动触发并带 PIN 审计；
+  需要的 Secrets：`CONFIG_JSON` / `MASTER_B64` / `SIGNING_KEY` / `PUBLIC_KEY_PIN`。
+
 | 用途 | 路径 |
 |---|---|
 | 原包 | `C:\Users\qiqi\Downloads\ChaiChaiEmbyTV-0.3.1-alpha3-arm64-v8a.apk` |

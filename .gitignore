@@ -3,6 +3,7 @@ config/config.json
 
 # 密钥与打包签名
 keys/
+keys-prod/
 *.pem
 *.b64
 *.keystore
@@ -54,3 +55,6 @@ build/*.hex
 app/assets/sync_config.json
 build/check-*/
 build/store-test/
+
+# 本地校验/测试产物（不提交）
+build/verify32/

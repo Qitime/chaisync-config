@@ -11,15 +11,20 @@
  *   node tools/check-keys.mjs --apk dist/Xemby-tv-1.3.apk
  *   node tools/check-keys.mjs --apk dist/Xemby-tv-1.3.apk --env dist/config.enc.json
  *   node tools/check-keys.mjs --apk dist/Xemby-tv-1.3.apk --env https://raw.githubusercontent.com/.../config.enc.json
+ *   node tools/check-keys.mjs --apk dist/Xemby-tv-1.3.apk --expect prod
+ *   node tools/check-keys.mjs --envelope dist/config.enc.json --keys-dir keys-prod --expect prod
+ *   node tools/check-keys.mjs --envelope https://raw.githubusercontent.com/.../config.enc.json --keys-dir keys-prod
  *
  * 退出码：0 = 密钥与信封匹配；1 = 不匹配或无法判定（构建应当失败）
  *
  * 零依赖：只用 Node 内置 crypto + 系统自带 unzip 能力（直接读 zip，不调外部命令）。
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const NS = 'chai-config-v1';
 
@@ -155,6 +160,28 @@ function arg(name, dflt) {
   return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : dflt;
 }
 
+function sha256hex(b) {
+  return crypto.createHash('sha256').update(b).digest('hex');
+}
+
+/** pubkey.hex 指纹（16 字节） */
+function pubFingerprint(pubKeyHex) {
+  return sha256hex(Buffer.from(String(pubKeyHex).trim(), 'hex')).slice(0, 32);
+}
+
+/** 读取 config/expected-keyset.json 指纹（与 tools/publish.mjs 同构） */
+function loadExpectedFp(name) {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const f = join(root, 'config', 'expected-keyset.json');
+  if (!existsSync(f)) return null;
+  try {
+    const j = JSON.parse(readFileSync(f, 'utf8'));
+    return (j[name || 'prod'] || {}).fingerprint || null;
+  } catch {
+    return null;
+  }
+}
+
 async function loadEnvelope(src) {
   if (/^https?:\/\//i.test(src)) {
     const r = await fetch(src, { headers: { 'user-agent': 'chai-check-keys/1' } });
@@ -167,38 +194,90 @@ async function loadEnvelope(src) {
 async function main() {
   const apk = arg('apk');
   const envSrc = arg('env', '');
+  const envOnly = arg('envelope', '');
   const allowMismatch = process.argv.includes('--allow-mismatch');
+  const expect = arg('expect', '');
+  const keysDir = arg('keys-dir', '');
 
-  if (!apk) {
-    console.error('用法：node tools/check-keys.mjs --apk <apk> [--env <file|url>] [--allow-mismatch]');
-    process.exit(2);
+  // 两种模式：--apk（构建自检）或 --envelope（纯信封校验）
+  let pub = '';
+  let master = '';
+  let label = '';
+  let src = envSrc;
+  if (envOnly) {
+    src = envOnly;
+    label = 'ENVELOPE';
+    if (keysDir) {
+      try {
+        pub = readFileSync(keysDir + '/pubkey.hex', 'utf8');
+        master = readFileSync(keysDir + '/master.b64', 'utf8').trim();
+      } catch {
+        console.error('✗ 读取密钥目录失败，请检查 --keys-dir');
+        process.exit(2);
+      }
+    } else {
+      pub = arg('pub', '');
+      master = arg('master', '');
+    }
+    if (!pub || !master) {
+      console.error('用法：node tools/check-keys.mjs --envelope <file|url> --keys-dir <dir> [--expect <name>]');
+      console.error('      或 --envelope <file|url> --pub <pubkey.hex> --master <MASTER_B64>');
+      process.exit(2);
+    }
+    console.log('模式     ' + label);
+  } else {
+    if (!apk) {
+      console.error('用法：node tools/check-keys.mjs --apk <apk> [--env <file|url>] [--expect <name>] [--allow-mismatch]');
+      console.error('       node tools/check-keys.mjs --envelope <file|url> --keys-dir <dir> [--expect <name>]');
+      process.exit(2);
+    }
+    const cfg = JSON.parse(readZipEntry(apk, 'assets/sync_config.json').toString('utf8'));
+    pub = cfg.pubKeyHex || '';
+    master = cfg.masterB64 || '';
+    label = 'APK';
+    console.log('APK      ' + apk);
+    console.log('pubKey   ' + (pub ? pub.slice(0, 24) + '…' + pub.slice(-8) : '（缺失）'));
+    console.log('master   ' + (master ? master.slice(0, 8) + '…' : '（缺失）'));
+    console.log('rawUrl   ' + (cfg.rawUrl || '（缺失）'));
+
+    // 结构自检：缺任何一样，App 在 run() 里会直接 return，表现成"从不同步"
+    const missing = [];
+    if (!pub) missing.push('pubKeyHex');
+    if (!master) missing.push('masterB64');
+    if (!cfg.rawUrl) missing.push('rawUrl');
+    if (!Array.isArray(cfg.mirrors) || cfg.mirrors.length === 0) missing.push('mirrors');
+    if (missing.length) {
+      console.error('\n✗ assets/sync_config.json 不完整，缺：' + missing.join(', '));
+      process.exit(1);
+    }
+    if (!src) src = cfg.rawUrl;
   }
 
-  const cfg = JSON.parse(readZipEntry(apk, 'assets/sync_config.json').toString('utf8'));
-  const pub = cfg.pubKeyHex || '';
-  const master = cfg.masterB64 || '';
-  console.log('APK      ' + apk);
-  console.log('pubKey   ' + (pub ? pub.slice(0, 24) + '…' + pub.slice(-8) : '（缺失）'));
-  console.log('master   ' + (master ? master.slice(0, 8) + '…' : '（缺失）'));
-  console.log('rawUrl   ' + (cfg.rawUrl || '（缺失）'));
-
-  // 结构自检：缺任何一样，App 在 run() 里会直接 return，表现成"从不同步"
-  const missing = [];
-  if (!pub) missing.push('pubKeyHex');
-  if (!master) missing.push('masterB64');
-  if (!cfg.rawUrl) missing.push('rawUrl');
-  if (!Array.isArray(cfg.mirrors) || cfg.mirrors.length === 0) missing.push('mirrors');
-  if (missing.length) {
-    console.error('\n✗ assets/sync_config.json 不完整，缺：' + missing.join(', '));
-    process.exit(1);
+  // 指纹断言（--expect 或默认期望台账）
+  const fp = pub ? pubFingerprint(pub) : '';
+  console.log('fingerprint ' + (fp || '（缺失）'));
+  if (expect && fp) {
+    const expected = loadExpectedFp(expect);
+    if (!expected) {
+      console.error('✗ config/expected-keyset.json 里没有[' + expect + ']指纹，无法断言');
+      process.exit(1);
+    }
+    if (fp !== expected) {
+      console.error('✗ fingerprint ' + fp + ' ≠ expected[' + expect + '] ' + expected);
+      console.error('  该' + label + '钉的不是期望密钥组，禁止发布。');
+      if (allowMismatch) {
+        console.log('  已按 --allow-mismatch 放行');
+        process.exit(0);
+      }
+      process.exit(1);
+    }
+    console.log('  ✓ 指纹断言通过');
   }
 
-  const src = envSrc || cfg.rawUrl;
   let env;
   try {
     env = await loadEnvelope(src);
   } catch (e) {
-    // 网络问题不等于密钥错。这里退出码用 2，让调用方能把"验不了"和"验不过"分开。
     console.error(`\n! 取不到信封（${src}）：${e.message}`);
     if (allowMismatch) {
       console.log('  已按 --allow-mismatch 放行（离线构建）');
