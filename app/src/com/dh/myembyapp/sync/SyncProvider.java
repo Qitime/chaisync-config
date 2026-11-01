@@ -16,14 +16,24 @@ import org.json.JSONObject;
  * 所以这里写进 SharedPreferences 的值，会被<b>同一次启动</b>的首屏直接读到。
  * 这是"改完账号不用重开两次"的前提。
  *
- * <p>启动决策树：
+ * <p>启动决策树（本地优先，云端兜底）：
  * <pre>
  *   首次运行（从没同步成功过）        → 阻塞拉取（≤9s）→ 写入 → 进入
  *   已同步过 → 先应用待生效缓存（0ms）
- *        ├ 探测当前服务器通过          → 直接进入；后台顺手拉一次（只更新缓存）
- *        └ 探测失败                    → 阻塞拉取 → 立即写入 → 同一屏用新配置进入
+ *        ├ 探测当前服务器 token 有效    → 直接进入（零网络，不做任何拉取）
+ *        ├ 探测 token 失效（401/403）  → ① 本地账密重登 → 成功 → 进入
+ *        │                               → ② 失败 → 拉云端 → 再试本地
+ *        │                               → ③ 双失败 → 弹窗「需更新账号」
+ *        └ 服务器不可达 / 非凭据故障    → ① 先本地 failover 切换
+ *                                        → ② 全不可达 → 拉云端
  *   拉取失败（镜像全挂 / 信封被拒）    → 保留本地配置进入，原因写 sync_status.txt
  * </pre>
+ *
+ * <p>避免无效云端拉取的原则：只有「首次运行」或「本地明确无法恢复」（token 失效且
+ * 重登失败 / 本地全部服务器不可达）才碰 GitHub；token 有效时不发起任何网络请求。
+ *
+ * <p>弹窗只在「本地重登失败 + 云端拉取也未能恢复」双失败后触发（见
+ * {@link SelfHeal#notifyCredentialOutdated}），避免云端能救回时打扰用户。
  *
  * <p>注意这里<b>没有</b>设备码、没有 HMAC、没有"设备未授权"这条分支：
  * 端点已经是公开文件，鉴权靠签名，不靠设备身份。
@@ -70,27 +80,91 @@ public final class SyncProvider extends ContentProvider {
         boolean firstRun = sync.getLong("last_seq", -1) < 0;
 
         // 先把上次验签通过但没来得及应用的正文落地（0ms，不联网）
-        boolean appliedCache = Store.applyCached(ctx, sync);
+        Store.applyCached(ctx, sync);
 
+        // ============ 首次运行：本地无配置，必须拉云端 ============
         if (firstRun) {
             Probe.journal(ctx, "first run -> blocking fetch");
             pullAndApply(ctx, sync, cfg, cfg.fetchBudgetMs);
-            // 第一次下发多台服务器时，默认那台未必可达；在进入首屏前先找一个能用的
+            // 多台服务器时筛出最先可用的一台
             Probe.failover(ctx, 700, 1000, 3500);
+            // 拉取后若 token 仍失效，用本地账密重登兜底（首次场景不弹窗：
+            // 无登录态时 MainActivity 自己会进登录页）
+            SelfHeal.tryRelogin(ctx, cfg.probeTcpMs, cfg.probeHttpMs);
             return;
         }
 
+        // ============ 非首次：先探测当前服务器 ============
         String probe = Probe.check(ctx, cfg.probeTcpMs, cfg.probeHttpMs);
+
         if (probe.startsWith("ok")) {
-            // 主流路径：服务器好好的，完全不碰 GitHub
-            Probe.journal(ctx, "probe ok (" + probe + ") cachedApplied=" + appliedCache + " -> fast path");
-            backgroundRefresh(ctx, sync, cfg);
+            // token 有效：零网络直进（不再后台拉取，避免无效请求）
+            Probe.journal(ctx, "probe ok (" + probe + ") -> fast path (zero network)");
             return;
         }
 
-        Probe.journal(ctx, "probe failed (" + probe + ") -> repair fetch");
+        if (probe.startsWith("token-invalid:") || probe.startsWith("not-logged-in")) {
+            // 凭据失效（401/403）或凭据缺失（云端只下发账密、无 token）：
+            // 先用本地账密重登；成功即直进
+            if (healLocal(ctx, cfg)) {
+                return;
+            }
+            // ② 本地重登失败 → 才拉云端（云端可能已下发新账密/新服务器）
+            Probe.journal(ctx, "local heal failed -> cloud repair");
+            cloudRepair(ctx, sync, cfg);
+            // ③ 拉取后再试一次本地（新账密可能已生效）
+            if (!healLocal(ctx, cfg)) {
+                // 双失败（本地重登失败 + 云端拉取也未能恢复）→ 弹窗提示更新账号
+                Probe.journal(ctx, "selfheal double-fail -> notify");
+                SelfHeal.notifyCredentialOutdated(ctx);
+            }
+            return;
+        }
+
+        // ============ 服务器不可达 / 非凭据故障（tcp/tls/5xx/slow）============
+        Probe.journal(ctx, "probe failed (" + probe + ") -> local failover first");
+        // ① 先在本地其它服务器之间切换；一台都不剩才允许拉云端
+        String winner = Probe.failover(ctx, 700, 1000, 3500);
+        if (winner == null) {
+            Probe.journal(ctx, "no usable local server -> cloud repair");
+            cloudRepair(ctx, sync, cfg);
+            return;
+        }
+        // ② 切换成功后重新探测当前（新）服务器
+        String after = Probe.check(ctx, cfg.probeTcpMs, cfg.probeHttpMs);
+        if (after.startsWith("ok")) {
+            Probe.journal(ctx, "failover ok -> fast path");
+            return;
+        }
+        if (after.startsWith("token-invalid:") || after.startsWith("not-logged-in")) {
+            // 切换后的服务器凭据缺失/失效 → 本地重登
+            if (healLocal(ctx, cfg)) {
+                return;
+            }
+            Probe.journal(ctx, "failover token-invalid, local heal failed -> cloud repair");
+            cloudRepair(ctx, sync, cfg);
+            if (!healLocal(ctx, cfg)) {
+                Probe.journal(ctx, "selfheal double-fail (failover) -> notify");
+                SelfHeal.notifyCredentialOutdated(ctx);
+            }
+            return;
+        }
+        // ③ 切换后仍不可达 → 拉云端
+        Probe.journal(ctx, "failover still unreachable -> cloud repair");
+        cloudRepair(ctx, sync, cfg);
+    }
+
+    /** 本地重登并确认新 token 已生效 */
+    private static boolean healLocal(Context ctx, Store.AppConfig cfg) {
+        if (!SelfHeal.tryRelogin(ctx, cfg.probeTcpMs, cfg.probeHttpMs)) {
+            return false;
+        }
+        return Probe.check(ctx, cfg.probeTcpMs, cfg.probeHttpMs).startsWith("ok");
+    }
+
+    /** 拉取云端信封 + 应用 + 本地 failover 筛活 */
+    private static void cloudRepair(Context ctx, SharedPreferences sync, Store.AppConfig cfg) {
         pullAndApply(ctx, sync, cfg, cfg.fetchBudgetMs);
-        // 拉取失败（镜像全挂/无新配置）时也要在本地多台服务器之间兜底切换
         Probe.failover(ctx, 700, 1000, 3500);
     }
 
@@ -253,22 +327,6 @@ public final class SyncProvider extends ContentProvider {
             }
         }
         return false;
-    }
-
-    /**
-     * 健康路径下的后台拉取：只更新缓存，不动当前生效配置。
-     * 用途是"旧服务器还活着，但你想主动换一台"——下次启动生效。
-     */
-    private static void backgroundRefresh(final Context ctx, final SharedPreferences sync,
-                                          final Store.AppConfig cfg) {
-        Thread t = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                pullAndApply(ctx, sync, cfg, 5000);
-            }
-        }, "chai-sync-bg");
-        t.setDaemon(true);
-        t.start();
     }
 
     private static String hostOf(String url) {

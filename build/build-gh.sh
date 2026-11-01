@@ -188,6 +188,15 @@ else:
     t = t.replace('</application>', prov + '</application>')
     changed.append("provider")
 
+# 自愈失败弹窗 Activity（SelfHeal 启动）
+act_tag = 'com.dh.myembyapp.sync.CredentialNotifyActivity'
+if act_tag not in t:
+    act = ('    <activity android:name="com.dh.myembyapp.sync.CredentialNotifyActivity" '
+           'android:theme="@android:style/Theme.Material.Dialog" '
+           'android:excludeFromRecents="true" android:exported="false" />\n')
+    t = t.replace('</application>', act + '</application>')
+    changed.append("credential-notify-activity")
+
 # 应用名改成字面量：只动 AndroidManifest，不碰 resources.arsc，
 # 这样所有语言下显示的都是 Xemby，也不会因为重建资源表而改变其它资源 ID。
 label = 'android:label="@string/app_name"'
@@ -205,7 +214,7 @@ if [ "$PKG" != "com.dh.myembyapp" ]; then
   "$PY" "$HERE/retarget.py" "$MANIFEST" "$PKG"
 fi
 
-PATCH_KEY="$DECODE_KEY|$PKG|$TREE_FP"
+PATCH_KEY="$DECODE_KEY|$PKG|$TREE_FP|inj2"
 if [ -z "${FORCE_BUILD:-}" ] && [ -f "$PATCHED" ] && [ -f "$PATCHED_STAMP" ] \
    && [ "$(cat "$PATCHED_STAMP")" = "$PATCH_KEY" ]; then
   echo "[4/7] 复用已打包基座（清单/资源/包名未变，跳过 apktool b）"
